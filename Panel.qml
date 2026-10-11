@@ -33,6 +33,10 @@ Panel {
   property bool loading: false
   property bool dirty: false
   property bool savePending: false
+  readonly property string buildTag: "7"
+  property string lastSaved: ""
+  property double lastClosedAt: 0
+  property string lastClosedMode: ""
   property int configRev: 0   // bumps when the config file is (re)loaded; text fields re-sync on it
   property bool refreshQueued: false
   property string statusText: ""
@@ -243,6 +247,23 @@ Panel {
     return a.state === "post" ? ta > tb : ta < tb
   }
 
+  // A favourite team with no game inside its look-ahead window still gets a
+  // slide, so a team you add always appears right away.
+  function teamPlaceholder(key) {
+    var favs = (scores && scores.favorites) || []
+    var f = null
+    for (var i = 0; i < favs.length; i++) if (favs[i].key === key) { f = favs[i]; break }
+    var idx = key.lastIndexOf(":")
+    var lp = key.substring(0, idx)
+    var abbr = key.substring(idx + 1)
+    return {
+      kind: "team", fav: true, state: "pre", team_key: key, league_path: lp,
+      league_label: f ? f.league_label : Model.labelFor(lp),
+      abbr: abbr, name: f ? f.name : abbr, logo: f ? f.logo : "",
+      color: (f && f.color) ? f.color : "", days: teamAhead(key)
+    }
+  }
+
   function favoriteGameTiles() {
     var games = (scores && scores.games) || []
     var teams = config.teams || []
@@ -259,6 +280,8 @@ Panel {
       if (best) {
         var id = best.league_path + "|" + best.name + "|" + best.start
         if (!seen[id]) { seen[id] = true; out.push(best) }
+      } else {
+        out.push(teamPlaceholder(key))
       }
     }
     return out
@@ -329,6 +352,7 @@ Panel {
     if (!t) return "this_week"
     if (t.kind === "game") return gameCategory(t)
     if (t.kind === "league") return t.live > 0 ? "live" : "this_week"
+    if (t.kind === "team") return "final"
     if (t.state === "in") return "live"
     if (t.state === "post") return "final"
     return "this_week"
@@ -357,6 +381,9 @@ Panel {
   // view again closes the dropdown; clicking the other one just switches.
   function showMode(m) {
     if (opened && mode === m) { close(); return }
+    // The panel can close itself on the press that reaches us (click-away);
+    // treat that press as the "close" click instead of reopening.
+    if (!opened && lastClosedMode === m && (Date.now() - lastClosedAt) < 350) return
     mode = m
     if (!opened) open()
   }
@@ -372,6 +399,7 @@ Panel {
   function tileTitle(t) {
     if (!t) return ""
     if (t.kind === "league") return t.league_label + " scoreboard"
+    if (t.kind === "team") return t.name
     if (t.kind === "game") {
       var s = (t.away && t.away.fav) ? t.away : ((t.home && t.home.fav) ? t.home : null)
       return s ? s.name : (t.away.abbr + " @ " + t.home.abbr)
@@ -391,6 +419,7 @@ Panel {
     if (t.kind === "league") {
       return t.league_label + " · " + (t.live > 0 ? t.live + " live" : t.games.length + " games")
     }
+    if (t.kind === "team") return t.abbr + " · no game"
     if (t.kind === "race" || t.kind === "golf") {
       var d = String(t.detail || "")
       if (d.length > 10) d = d.substring(0, 10)
@@ -720,6 +749,26 @@ Panel {
               visible: !!root.currentTile && root.currentTile.kind === "game"
               game: (root.currentTile && root.currentTile.kind === "game") ? root.currentTile : null
             }
+            Column {
+              width: parent.width
+              spacing: Style.space(8)
+              visible: !!root.currentTile && root.currentTile.kind === "team"
+              TeamBlock {
+                width: parent.width
+                side: (root.currentTile && root.currentTile.kind === "team") ? root.currentTile : null
+              }
+              Text {
+                width: parent.width
+                horizontalAlignment: Text.AlignHCenter
+                wrapMode: Text.WordWrap
+                text: (root.currentTile && root.currentTile.kind === "team")
+                      ? (root.loading ? "Checking the schedule…" : "No " + root.currentTile.league_label + " game in the next " + root.currentTile.days + " days. Raise this team's look-ahead in Settings to see further.")
+                      : ""
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.bodySmall
+              }
+            }
             ScoreSection {
               title: (root.currentTile && root.currentTile.kind === "league") ? root.currentTile.league_label + " SCOREBOARD" : ""
               games: (root.currentTile && root.currentTile.kind === "league") ? root.currentTile.games : []
@@ -768,8 +817,7 @@ Panel {
             Text {
               width: parent.width
               horizontalAlignment: Text.AlignHCenter
-              visible: root.updatedText !== ""
-              text: "Updated " + root.updatedText
+              text: (root.updatedText !== "" ? "Updated " + root.updatedText + " · " : "") + "build " + root.buildTag
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -1152,7 +1200,14 @@ Panel {
                 fontFamily: root.fontFamily
                 onClicked: root.refresh()
               }
-              Item { Layout.fillWidth: true }
+              Text {
+                Layout.fillWidth: true
+                elide: Text.ElideMiddle
+                text: (root.lastSaved !== "" ? "Saved " + root.lastSaved + " → " : "") + root.configPath
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
               Button {
                 text: root.dirty ? "Save now" : "Saved"
                 active: root.dirty
@@ -1512,7 +1567,7 @@ Panel {
     watchChanges: false
     printErrors: false
     onLoaded: root.applyConfigText(text())
-    onLoadFailed: { root.config = root.defaultConfig(); root.saveConfig() }
+    onLoadFailed: root.saveConfig()
   }
 
   Process {
@@ -1530,11 +1585,22 @@ Panel {
       onStreamFinished: {
         try {
           var parsed = JSON.parse(text)
-          if (parsed && typeof parsed === "object") root.scores = parsed
+          if (parsed && typeof parsed === "object") {
+            root.scores = parsed
+            if (parsed.error) root.statusText = "Fetch error: " + parsed.error
+          }
         } catch (e) {
           root.statusText = "Could not read scores"
         }
         root.loading = false
+      }
+    }
+    stderr: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: {
+        var lines = String(text).trim().split("\n")
+        var last = lines[lines.length - 1]
+        if (last) root.statusText = "Fetch failed: " + last
       }
     }
     onRunningChanged: {
@@ -1549,7 +1615,8 @@ Panel {
     id: saveProc
     running: false
     onExited: function(exitCode) {
-      if (exitCode !== 0) { root.dirty = true; root.statusText = "Could not save settings" }
+      if (exitCode !== 0) { root.dirty = true; root.statusText = "Could not save settings (exit " + exitCode + ")" }
+      else root.lastSaved = Qt.formatTime(new Date(), "h:mm:ss AP") + " · " + (root.config.teams || []).length + " teams"
     }
     onRunningChanged: {
       if (running) return
@@ -1588,7 +1655,14 @@ Panel {
     onTriggered: root.rotateIndex = (root.safeIndex + 1) % Math.max(1, root.tiles.length)
   }
 
-  onOpenedChanged: { if (opened) root.refresh(); else if (dirty) root.saveConfig() }
+  onOpenedChanged: {
+    if (opened) root.refresh()
+    else {
+      root.lastClosedAt = Date.now()
+      root.lastClosedMode = root.mode
+      if (dirty) root.saveConfig()
+    }
+  }
   Component.onCompleted: root.refresh()
 
   // First run after install: ask where the widget should live in the bar.
