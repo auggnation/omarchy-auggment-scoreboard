@@ -22,11 +22,14 @@ DEFAULTS = {
     "racing": {},
     "golf": [],
     "team_colors": {},
+    "days_ahead_teams": {},
     "days_back": 1,
     "days_ahead": 7,
     "refresh_seconds": 60,
     "rotate_seconds": 6,
     "max_games": 40,
+    "position": "right",
+    "positioned": False,
 }
 
 

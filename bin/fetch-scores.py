@@ -537,6 +537,19 @@ def build(cfg):
     tz = tzinfo(cfg.get("timezone", "America/Chicago"))
     days_back = int(cfg.get("days_back", 1))
     days_ahead = int(cfg.get("days_ahead", 7))
+    team_windows = cfg.get("days_ahead_teams", {}) or {}
+
+    def window_for(path):
+        """A league must be fetched far enough for its longest per-team window."""
+        eff = days_ahead
+        prefix = path.lower() + ":"
+        for k, v in team_windows.items():
+            if isinstance(k, str) and k.lower().startswith(prefix):
+                try:
+                    eff = max(eff, int(v))
+                except Exception:
+                    pass
+        return eff
 
     fav_set = set()
     for entry in cfg.get("teams", []):
@@ -550,7 +563,7 @@ def build(cfg):
     games, races, golf = [], [], []
     league_paths = [p for p in cfg.get("leagues", []) if isinstance(p, str)]
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(league_paths)))) as pool:
-        fetched = list(pool.map(lambda p: (p, _safe_fetch(p, days_back, days_ahead)), league_paths))
+        fetched = list(pool.map(lambda p: (p, _safe_fetch(p, days_back, window_for(p))), league_paths))
     for path, events in fetched:
         for event in events:
             try:
