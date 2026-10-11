@@ -32,7 +32,22 @@ Panel {
   property int rotateIndex: 0
   property bool loading: false
   property bool dirty: false
+  property bool savePending: false
+  property bool refreshQueued: false
   property string statusText: ""
+
+  // Colours for the four game states; overridable via config.state_colors.
+  readonly property var defaultStateColors: ({
+    live: "#22C55E", today: "#F59E0B", this_week: "#60A5FA", final: "#9CA3AF"
+  })
+  readonly property var stateColorRows: [
+    { key: "live", label: "Game in progress" },
+    { key: "today", label: "Game today" },
+    { key: "this_week", label: "Game later this week" },
+    { key: "final", label: "Game over" }
+  ]
+  readonly property bool showBarLogos: config.bar_logos !== false
+  readonly property bool cycleLeagues: config.cycle_leagues !== false
 
   readonly property color fg: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(fg, 1.5)
@@ -55,6 +70,9 @@ Panel {
       refresh_seconds: 60,
       rotate_seconds: 6,
       max_games: 40,
+      state_colors: {},
+      bar_logos: true,
+      cycle_leagues: true,
       position: "right",
       positioned: false
     }
@@ -66,6 +84,26 @@ Panel {
     copy[key] = value
     config = copy
     dirty = true
+    autosaveTimer.restart()
+  }
+
+  // "#RRGGBB" (leading # optional) -> normalized string, "" for blank, null if invalid.
+  function normalizeHex(v) {
+    var s = String(v || "").trim()
+    if (s === "") return ""
+    if (s.charAt(0) !== "#") s = "#" + s
+    return /^#[0-9a-fA-F]{6}$/.test(s) ? s.toUpperCase() : null
+  }
+
+  function setColorMap(configKey, mapKey, text) {
+    var n = normalizeHex(text)
+    if (n === null) { statusText = "Colors must look like #RRGGBB"; return }
+    var colors = {}
+    var existing = config[configKey] || {}
+    for (var k in existing) colors[k] = existing[k]
+    if (n === "") delete colors[mapKey]
+    else colors[mapKey] = n
+    setConfig(configKey, colors)
   }
 
   function applyConfigText(txt) {
@@ -81,13 +119,19 @@ Panel {
     config = base
   }
 
+  // Settings are written to ~/.config/auggment/scoreboard.json automatically
+  // (debounced after every change, and when the panel closes). The JSON is
+  // passed as an argument so nothing depends on a stdin pipe being closed.
   function saveConfig() {
-    if (saveProc.running) return
+    autosaveTimer.stop()
+    if (saveProc.running) { savePending = true; return }
+    saveProc.command = ["python3", saveConfigScript, "--data", JSON.stringify(config)]
+    dirty = false
     saveProc.running = true
   }
 
   function refresh() {
-    if (fetchProc.running) return
+    if (fetchProc.running) { refreshQueued = true; return }
     loading = true
     statusText = ""
     fetchProc.running = true
@@ -160,19 +204,92 @@ Panel {
   }
 
   // ---- tiles for the bar rotation ----------------------------------------
+  // Order: one tile per favourite team (config order), favourite racing/golf,
+  // and finally the league scoreboard(s). The bar and the Current game view
+  // both show tiles[rotateIndex], so they always match.
+
+  function normKey(k) {
+    var s = String(k || "")
+    var i = s.lastIndexOf(":")
+    if (i < 0) return s.toLowerCase()
+    return s.substring(0, i).toLowerCase() + ":" + s.substring(i + 1).toUpperCase()
+  }
+
+  function gameInvolves(g, key) {
+    var sides = [g.away, g.home]
+    for (var i = 0; i < sides.length; i++) {
+      var s = sides[i]
+      if (s && s.fav && (String(g.league_path).toLowerCase() + ":" + String(s.abbr).toUpperCase()) === key) return true
+    }
+    return false
+  }
+
+  // Live beats upcoming beats final; soonest upcoming, most recent final.
+  function betterGame(a, b) {
+    var ra = Model.stateRank(a.state)
+    var rb = Model.stateRank(b.state)
+    if (ra !== rb) return ra < rb
+    var ta = Date.parse(a.start)
+    var tb = Date.parse(b.start)
+    if (isNaN(ta) || isNaN(tb)) return false
+    return a.state === "post" ? ta > tb : ta < tb
+  }
+
+  function favoriteGameTiles() {
+    var games = (scores && scores.games) || []
+    var teams = config.teams || []
+    var out = []
+    var seen = {}
+    for (var i = 0; i < teams.length; i++) {
+      var key = normKey(teams[i])
+      var best = null
+      for (var j = 0; j < games.length; j++) {
+        var g = games[j]
+        if (!gameVisible(g) || !gameInvolves(g, key)) continue
+        if (!best || betterGame(g, best)) best = g
+      }
+      if (best) {
+        var id = best.league_path + "|" + best.name + "|" + best.start
+        if (!seen[id]) { seen[id] = true; out.push(best) }
+      }
+    }
+    return out
+  }
+
+  function leagueTiles() {
+    if (!cycleLeagues) return []
+    var games = (scores && scores.games) || []
+    var paths = (config.leagues || []).filter(function(p) { return !Model.isRacing(p) && !Model.isGolf(p) })
+    var out = []
+    for (var i = 0; i < paths.length; i++) {
+      var lp = paths[i]
+      var list = games.filter(function(g) { return g.league_path === lp })
+      if (list.length === 0) continue
+      list.sort(function(a, b) {
+        var d = Model.stateRank(a.state) - Model.stateRank(b.state)
+        return d !== 0 ? d : String(a.start).localeCompare(String(b.start))
+      })
+      var live = list.filter(function(g) { return g.state === "in" }).length
+      out.push({ kind: "league", league_path: lp, league_label: list[0].league_label || Model.labelFor(lp),
+                 games: list, live: live, state: live > 0 ? "in" : "pre" })
+    }
+    return out
+  }
 
   readonly property var tiles: {
     var data = scores || {}
-    var out = []
-    var games = data.games || []
-    for (var i = 0; i < games.length && out.length < 30; i++) if (gameVisible(games[i])) out.push(games[i])
+    var out = favoriteGameTiles()
     var races = data.races || []
-    for (var j = 0; j < races.length && out.length < 30; j++) if (races[j].is_fav) out.push(races[j])
+    for (var j = 0; j < races.length; j++) if (races[j].is_fav) out.push(races[j])
     var golf = data.golf || []
-    for (var g = 0; g < golf.length && out.length < 30; g++) if (golf[g].is_fav) out.push(golf[g])
+    for (var g = 0; g < golf.length; g++) if (golf[g].is_fav) out.push(golf[g])
+    var lt = leagueTiles()
+    for (var k = 0; k < lt.length; k++) out.push(lt[k])
     return out
   }
-  readonly property var currentTile: tiles.length > 0 ? tiles[rotateIndex % tiles.length] : null
+  readonly property int safeIndex: tiles.length > 0 ? ((rotateIndex % tiles.length) + tiles.length) % tiles.length : 0
+  readonly property var currentTile: tiles.length > 0 ? tiles[safeIndex] : null
+  readonly property var barGame: (currentTile && currentTile.kind === "game") ? currentTile : null
   readonly property bool hasFavorites: {
     if ((config.teams || []).length > 0) return true
     if ((config.golf || []).length > 0) return true
@@ -181,45 +298,69 @@ Panel {
     return false
   }
 
-  function stateColor(state) {
-    if (state === "in") return Color.accent
-    if (state === "post") return Color.muted
-    return fg
+  // ---- colours ------------------------------------------------------------
+
+  function stateColorFor(cat) {
+    var v = (config.state_colors || {})[cat]
+    return v ? v : defaultStateColors[cat]
   }
 
-  function favoriteColor(t) {
-    if (!t || t.kind !== "game") return ""
-    var sides = [t.away, t.home]
-    for (var i = 0; i < sides.length; i++) {
-      var s = sides[i]
-      if (s && s.fav && s.color) return s.color
-    }
-    return ""
+  function gameCategory(g) {
+    if (!g) return "this_week"
+    if (g.state === "in") return "live"
+    if (g.state === "post") return "final"
+    var t = Date.parse(g.start)
+    if (isNaN(t)) return "this_week"
+    var d = new Date(t)
+    var n = new Date()
+    var same = d.getFullYear() === n.getFullYear() && d.getMonth() === n.getMonth() && d.getDate() === n.getDate()
+    return same ? "today" : "this_week"
   }
 
-  // Bar label colour: the favourite team's colour if set, else the state colour.
-  readonly property color currentColor: {
-    var t = currentTile
-    if (!t) return fg
-    var c = favoriteColor(t)
-    if (c) return c
-    return stateColor(t.kind === "game" ? t.state : "")
+  function tileCategory(t) {
+    if (!t) return "this_week"
+    if (t.kind === "game") return gameCategory(t)
+    if (t.kind === "league") return t.live > 0 ? "live" : "this_week"
+    if (t.state === "in") return "live"
+    if (t.state === "post") return "final"
+    return "this_week"
   }
 
+  function categoryLabel(cat) {
+    if (cat === "live") return "LIVE"
+    if (cat === "today") return "TODAY"
+    if (cat === "final") return "FINAL"
+    return "UPCOMING"
+  }
+
+  function stateColor(t) { return stateColorFor(tileCategory(t)) }
+  function gameAccent(g) { return stateColorFor(gameCategory(g)) }
+
+  // Bar text colour for non-game tiles: the state colour.
+  readonly property color currentColor: currentTile ? stateColor(currentTile) : fg
+
+  // Favourite teams use their colour (custom if set, else ESPN's).
   function teamColor(side, fallback) {
     if (side && side.fav && side.color) return side.color
     return fallback
   }
 
-  function gameAccent(g) {
-    if (!g) return fg
-    var c = favoriteColor(g)
-    if (c) return c
-    return stateColor(g.state)
+  function rotateNext() {
+    if (tiles.length > 1) { rotateIndex = (safeIndex + 1) % tiles.length; rotateTimer.restart() }
   }
 
-  function rotateNext() {
-    if (tiles.length > 1) rotateIndex = (rotateIndex + 1) % tiles.length
+  function rotatePrev() {
+    if (tiles.length > 1) { rotateIndex = (safeIndex - 1 + tiles.length) % tiles.length; rotateTimer.restart() }
+  }
+
+  function tileTitle(t) {
+    if (!t) return ""
+    if (t.kind === "league") return t.league_label + " scoreboard"
+    if (t.kind === "game") {
+      var s = (t.away && t.away.fav) ? t.away : ((t.home && t.home.fav) ? t.home : null)
+      return s ? s.name : (t.away.abbr + " @ " + t.home.abbr)
+    }
+    return t.name || ""
   }
 
   function shortTime(s) {
@@ -231,6 +372,9 @@ Panel {
   function barLabel() {
     var t = currentTile
     if (!t) return loading ? "…" : "—"
+    if (t.kind === "league") {
+      return t.league_label + " · " + (t.live > 0 ? t.live + " live" : t.games.length + " games")
+    }
     if (t.kind === "race" || t.kind === "golf") {
       var d = String(t.detail || "")
       if (d.length > 10) d = d.substring(0, 10)
@@ -299,21 +443,93 @@ Panel {
   // -------------------------------------------------------------------------
   // Bar button
   // -------------------------------------------------------------------------
-  WidgetButton {
+  Item {
     id: button
     anchors.fill: parent
-    bar: root.bar
-    text: root.barLabel()
-    fontFamily: root.fontFamily
-    fontSize: Style.font.caption
-    horizontalMargin: 6
-    verticalPadding: 4
-    foreground: root.currentColor
-    tooltipText: "Auggment Scoreboard"
-    onPressed: function(b) {
-      if (b === Qt.RightButton) { root.mode = "settings"; root.open() }
-      else if (b === Qt.MiddleButton) root.refresh()
-      else { root.mode = "scores"; root.toggle() }
+    implicitWidth: barRow.implicitWidth + Style.space(12)
+    implicitHeight: Math.max(barRow.implicitHeight, Style.space(16)) + Style.space(8)
+
+    Rectangle {
+      anchors.fill: parent
+      radius: Style.cornerRadius
+      color: barMouse.containsMouse ? Style.hoverFillFor(root.fg, Color.accent) : "transparent"
+    }
+
+    Row {
+      id: barRow
+      anchors.centerIn: parent
+      spacing: Style.space(5)
+
+      // ---- game tile: [logo] AWAY 24–17 HOME [logo] ----
+      Image {
+        visible: root.showBarLogos && !!root.barGame && !!root.barGame.away.logo
+        width: Style.space(16); height: Style.space(16)
+        anchors.verticalCenter: parent.verticalCenter
+        fillMode: Image.PreserveAspectFit
+        asynchronous: true
+        smooth: true
+        sourceSize.width: 48; sourceSize.height: 48
+        source: visible ? root.barGame.away.logo : ""
+      }
+      Text {
+        visible: !!root.barGame
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.barGame ? root.barGame.away.abbr : ""
+        color: root.teamColor(root.barGame ? root.barGame.away : null, root.fg)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: true
+      }
+      Text {
+        visible: !!root.barGame
+        anchors.verticalCenter: parent.verticalCenter
+        text: !root.barGame ? "" : (root.barGame.state === "pre" ? "@" : root.barGame.away.score + "–" + root.barGame.home.score)
+        color: root.currentColor
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: true
+      }
+      Text {
+        visible: !!root.barGame
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.barGame ? root.barGame.home.abbr : ""
+        color: root.teamColor(root.barGame ? root.barGame.home : null, root.fg)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: true
+      }
+      Image {
+        visible: root.showBarLogos && !!root.barGame && !!root.barGame.home.logo
+        width: Style.space(16); height: Style.space(16)
+        anchors.verticalCenter: parent.verticalCenter
+        fillMode: Image.PreserveAspectFit
+        asynchronous: true
+        smooth: true
+        sourceSize.width: 48; sourceSize.height: 48
+        source: visible ? root.barGame.home.logo : ""
+      }
+
+      // ---- league / race / golf tile, or nothing to show ----
+      Text {
+        visible: !root.barGame
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.barLabel()
+        color: root.currentColor
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+    }
+
+    MouseArea {
+      id: barMouse
+      anchors.fill: parent
+      hoverEnabled: true
+      acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
+      onPressed: function(mouse) {
+        if (mouse.button === Qt.RightButton) { root.mode = "settings"; root.open() }
+        else if (mouse.button === Qt.MiddleButton) root.refresh()
+        else { root.mode = "current"; root.toggle() }
+      }
     }
   }
 
@@ -325,6 +541,9 @@ Panel {
     function hide(): void { root.close() }
     function toggle(): void { root.toggle() }
     function scores(): void { root.mode = "scores"; root.open() }
+    function current(): void { root.mode = "current"; root.open() }
+    function next(): void { root.rotateNext() }
+    function prev(): void { root.rotatePrev() }
     function settings(): void { root.mode = "settings"; root.open() }
     function refresh(): void { root.refresh() }
   }
@@ -339,8 +558,8 @@ Panel {
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
-    contentWidth: panel.fittedContentWidth(Style.space(420))
-    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(560))
+    contentWidth: panel.fittedContentWidth(Style.space(root.mode === "current" ? 500 : 420))
+    contentHeight: panel.fittedContentHeight(column.implicitHeight, Style.space(root.mode === "current" ? 640 : 560))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -349,7 +568,9 @@ Panel {
       onTabRequested: function(direction) { root.switchPanel(direction) }
       onTextKey: function(t) {
         if (t === "r" || t === "R") root.refresh()
-        else if (t === "s" || t === "S") root.mode = root.mode === "scores" ? "settings" : "scores"
+        else if (t === "s" || t === "S") root.mode = root.mode === "settings" ? "current" : "settings"
+        else if ((t === "n" || t === "N") && root.mode === "current") root.rotateNext()
+        else if ((t === "p" || t === "P") && root.mode === "current") root.rotatePrev()
       }
 
       Flickable {
@@ -389,13 +610,6 @@ Panel {
             spacing: Style.space(6)
 
             Button {
-              text: "League scores"
-              selected: root.mode === "scores"
-              foreground: root.fg
-              fontFamily: root.fontFamily
-              onClicked: root.mode = "scores"
-            }
-            Button {
               text: "Current game"
               selected: root.mode === "current"
               foreground: root.fg
@@ -403,10 +617,17 @@ Panel {
               onClicked: root.mode = "current"
             }
             Button {
-              text: "Next"
+              text: "League scores"
+              selected: root.mode === "scores"
               foreground: root.fg
               fontFamily: root.fontFamily
-              onClicked: root.rotateNext()
+              onClicked: root.mode = "scores"
+            }
+            Button {
+              text: "Next ▸"
+              foreground: root.fg
+              fontFamily: root.fontFamily
+              onClicked: { root.mode = "current"; root.rotateNext() }
             }
             Button {
               text: "Settings"
@@ -443,6 +664,9 @@ Panel {
             }
 
             ScoreSection { title: "YOUR TEAMS"; games: root.favGames; rootWidth: column.width }
+            ScoreSection { title: "LEAGUE · LIVE"; games: root.liveGames; rootWidth: column.width }
+            ScoreSection { title: "LEAGUE · UPCOMING"; games: root.preGames; rootWidth: column.width }
+            ScoreSection { title: "LEAGUE · FINAL"; games: root.postGames; rootWidth: column.width }
             LeaderSection { title: "RACING"; items: (root.scores.races || []); rootWidth: column.width }
             LeaderSection { title: "GOLF"; items: (root.scores.golf || []); rootWidth: column.width }
           }
@@ -463,9 +687,13 @@ Panel {
               wrapMode: Text.WordWrap
             }
 
+            BigGame {
+              visible: !!root.currentTile && root.currentTile.kind === "game"
+              game: (root.currentTile && root.currentTile.kind === "game") ? root.currentTile : null
+            }
             ScoreSection {
-              title: "NOW SHOWING"
-              games: (root.currentTile && root.currentTile.kind === "game") ? [root.currentTile] : []
+              title: (root.currentTile && root.currentTile.kind === "league") ? root.currentTile.league_label + " SCOREBOARD" : ""
+              games: (root.currentTile && root.currentTile.kind === "league") ? root.currentTile.games : []
               rootWidth: column.width
             }
             LeaderSection {
@@ -474,12 +702,32 @@ Panel {
               rootWidth: column.width
             }
 
-            Button {
+            RowLayout {
+              width: parent.width
               visible: root.tiles.length > 1
-              text: "Next ▸"
-              foreground: root.fg
-              fontFamily: root.fontFamily
-              onClicked: root.rotateNext()
+              spacing: Style.space(8)
+
+              Button {
+                text: "◂ Prev"
+                foreground: root.fg
+                fontFamily: root.fontFamily
+                onClicked: root.rotatePrev()
+              }
+              Text {
+                Layout.fillWidth: true
+                horizontalAlignment: Text.AlignHCenter
+                elide: Text.ElideRight
+                text: (root.safeIndex + 1) + " / " + root.tiles.length + "  ·  " + root.tileTitle(root.currentTile)
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+              }
+              Button {
+                text: "Next ▸"
+                foreground: root.fg
+                fontFamily: root.fontFamily
+                onClicked: root.rotateNext()
+              }
             }
           }
 
@@ -678,7 +926,7 @@ Panel {
               PanelSectionHeader { text: "TEAM COLORS"; foreground: root.fg; fontFamily: root.fontFamily }
               Text {
                 width: parent.width
-                text: "Override a team's bar color. Leave blank to use the team's own color."
+                text: "Color for this team's name in the bar and board. Leave blank to use the team's own color."
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
@@ -712,17 +960,82 @@ Panel {
                     placeholderText: "#RRGGBB"
                     foreground: root.fg
                     text: (root.config.team_colors || {})[modelData] || ""
-                    onEditingFinished: {
-                      var colors = {}
-                      var existing = root.config.team_colors || {}
-                      for (var k in existing) colors[k] = existing[k]
-                      var v = String(text || "").trim()
-                      if (v === "") delete colors[modelData]
-                      else colors[modelData] = v.startsWith("#") ? v : ("#" + v)
-                      root.setConfig("team_colors", colors)
-                    }
+                    onEditingFinished: root.setColorMap("team_colors", modelData, text)
                   }
                 }
+              }
+            }
+
+            Column {
+              width: parent.width
+              spacing: Style.space(8)
+
+              PanelSectionHeader { text: "GAME STATE COLORS"; foreground: root.fg; fontFamily: root.fontFamily }
+              Text {
+                width: parent.width
+                text: "Used for the status badge, accent and score. Hex like #22C55E; blank restores the default."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
+              }
+              Repeater {
+                model: root.stateColorRows
+                delegate: RowLayout {
+                  required property var modelData
+                  width: parent.width
+                  spacing: Style.space(8)
+
+                  Rectangle {
+                    Layout.preferredWidth: Style.space(14)
+                    Layout.preferredHeight: Style.space(14)
+                    radius: 3
+                    color: root.stateColorFor(modelData.key)
+                    border.color: root.dim
+                    border.width: 1
+                  }
+                  Text {
+                    Layout.fillWidth: true
+                    text: modelData.label
+                    color: root.fg
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                    elide: Text.ElideRight
+                  }
+                  TextField {
+                    Layout.preferredWidth: Style.space(110)
+                    placeholderText: root.defaultStateColors[modelData.key]
+                    foreground: root.fg
+                    text: (root.config.state_colors || {})[modelData.key] || ""
+                    onEditingFinished: root.setColorMap("state_colors", modelData.key, text)
+                  }
+                }
+              }
+            }
+
+            Column {
+              width: parent.width
+              spacing: Style.space(8)
+
+              PanelSectionHeader { text: "BAR & CYCLE"; foreground: root.fg; fontFamily: root.fontFamily }
+              RowLayout {
+                width: parent.width
+                spacing: Style.space(8)
+                Button {
+                  text: "Logos in bar: " + (root.showBarLogos ? "On" : "Off")
+                  selected: root.showBarLogos
+                  foreground: root.fg
+                  fontFamily: root.fontFamily
+                  onClicked: root.setConfig("bar_logos", !root.showBarLogos)
+                }
+                Button {
+                  text: "League at end: " + (root.cycleLeagues ? "On" : "Off")
+                  selected: root.cycleLeagues
+                  foreground: root.fg
+                  fontFamily: root.fontFamily
+                  onClicked: root.setConfig("cycle_leagues", !root.cycleLeagues)
+                }
+                Item { Layout.fillWidth: true }
               }
             }
 
@@ -733,7 +1046,7 @@ Panel {
               spacing: Style.space(8)
               Item { Layout.fillWidth: true }
               Button {
-                text: root.dirty ? "Save" : "Saved"
+                text: root.dirty ? "Save now" : "Saved"
                 active: root.dirty
                 foreground: root.fg
                 fontFamily: root.fontFamily
@@ -741,6 +1054,158 @@ Panel {
               }
             }
           }
+        }
+      }
+    }
+  }
+
+  // -------------------------------------------------------------------------
+  // Score rows
+  // -------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // Large "current game" card
+  // -------------------------------------------------------------------------
+  component TeamBlock: Column {
+    id: tb
+    property var side: null
+    spacing: Style.space(4)
+
+    Item {
+      width: parent.width
+      height: Style.space(72)
+      Image {
+        anchors.centerIn: parent
+        width: Style.space(72)
+        height: Style.space(72)
+        fillMode: Image.PreserveAspectFit
+        asynchronous: true
+        smooth: true
+        sourceSize.width: 160
+        sourceSize.height: 160
+        source: tb.side && tb.side.logo ? tb.side.logo : ""
+      }
+    }
+    Text {
+      width: parent.width
+      horizontalAlignment: Text.AlignHCenter
+      text: tb.side ? tb.side.abbr : ""
+      color: root.teamColor(tb.side, root.fg)
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.display
+      font.bold: true
+    }
+    Text {
+      width: parent.width
+      horizontalAlignment: Text.AlignHCenter
+      text: tb.side ? tb.side.name : ""
+      color: root.dim
+      font.family: root.fontFamily
+      font.pixelSize: Style.font.caption
+      elide: Text.ElideRight
+    }
+  }
+
+  component BigGame: Rectangle {
+    id: big
+    property var game: null
+    readonly property string cat: root.gameCategory(game)
+    readonly property color catColor: root.stateColorFor(cat)
+
+    width: parent ? parent.width : 0
+    implicitHeight: bigCol.implicitHeight + Style.space(28)
+    height: implicitHeight
+    radius: Style.cornerRadius * 2
+    color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.06)
+    border.width: 2
+    border.color: big.catColor
+
+    MouseArea {
+      anchors.fill: parent
+      cursorShape: big.game && big.game.link ? Qt.PointingHandCursor : Qt.ArrowCursor
+      onClicked: {
+        if (big.game && big.game.link) {
+          Quickshell.execDetached(["xdg-open", big.game.link])
+          root.close()
+        }
+      }
+    }
+
+    Column {
+      id: bigCol
+      anchors.left: parent.left
+      anchors.right: parent.right
+      anchors.verticalCenter: parent.verticalCenter
+      anchors.leftMargin: Style.space(14)
+      anchors.rightMargin: Style.space(14)
+      spacing: Style.space(12)
+
+      RowLayout {
+        width: parent.width
+        Text {
+          text: big.game ? big.game.league_label : ""
+          color: root.dim
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.caption
+        }
+        Item { Layout.fillWidth: true }
+        Rectangle {
+          id: badge
+          radius: height / 2
+          color: big.catColor
+          implicitWidth: badgeText.implicitWidth + Style.space(16)
+          implicitHeight: badgeText.implicitHeight + Style.space(6)
+          Text {
+            id: badgeText
+            anchors.centerIn: parent
+            text: root.categoryLabel(big.cat)
+            color: (badge.color.r * 0.299 + badge.color.g * 0.587 + badge.color.b * 0.114) > 0.55 ? "#111111" : "#FFFFFF"
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            font.bold: true
+          }
+        }
+      }
+
+      RowLayout {
+        width: parent.width
+        spacing: Style.space(8)
+
+        TeamBlock {
+          Layout.fillWidth: true
+          Layout.preferredWidth: 1
+          Layout.alignment: Qt.AlignTop
+          side: big.game ? big.game.away : null
+        }
+        Column {
+          Layout.preferredWidth: Style.space(130)
+          Layout.alignment: Qt.AlignVCenter
+          spacing: Style.space(4)
+
+          Text {
+            width: parent.width
+            horizontalAlignment: Text.AlignHCenter
+            text: !big.game ? "" : (big.game.state === "pre" ? "@" : big.game.away.score + " – " + big.game.home.score)
+            color: root.fg
+            font.family: root.fontFamily
+            font.pixelSize: Math.round(Style.font.display * 1.6)
+            font.bold: true
+          }
+          Text {
+            width: parent.width
+            horizontalAlignment: Text.AlignHCenter
+            wrapMode: Text.WordWrap
+            text: big.game ? root.gameDetail(big.game) : ""
+            color: big.catColor
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            font.bold: true
+          }
+        }
+        TeamBlock {
+          Layout.fillWidth: true
+          Layout.preferredWidth: 1
+          Layout.alignment: Qt.AlignTop
+          side: big.game ? big.game.home : null
         }
       }
     }
@@ -825,7 +1290,7 @@ Panel {
 
       Text {
         text: gameRow.game ? root.gameDetail(gameRow.game) : ""
-        color: root.stateColor(gameRow.game ? gameRow.game.state : "")
+        color: root.gameAccent(gameRow.game)
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
       }
@@ -929,17 +1394,33 @@ Panel {
         root.loading = false
       }
     }
-    onRunningChanged: if (!running) root.loading = false
+    onRunningChanged: {
+      if (!running) {
+        root.loading = false
+        if (root.refreshQueued) { root.refreshQueued = false; root.refresh() }
+      }
+    }
   }
 
   Process {
     id: saveProc
-    stdinEnabled: true
-    command: ["python3", root.saveConfigScript]
-    onStarted: {
-      write(JSON.stringify(root.config))
-      root.dirty = false
+    running: false
+    onExited: function(exitCode) {
+      if (exitCode !== 0) { root.dirty = true; root.statusText = "Could not save settings" }
     }
+    onRunningChanged: {
+      if (running) return
+      if (root.savePending) { root.savePending = false; root.saveConfig() }
+      else root.refresh()
+    }
+  }
+
+  // Debounced autosave: favourites and colours persist without pressing Save.
+  Timer {
+    id: autosaveTimer
+    interval: 600
+    repeat: false
+    onTriggered: root.saveConfig()
   }
 
   Process {
@@ -958,12 +1439,13 @@ Panel {
   Timer {
     id: rotateTimer
     interval: Math.max(2, root.config.rotate_seconds || 6) * 1000
-    running: root.bar !== null && root.tiles.length > 1
+    // Don't auto-advance while the big card is open; the user is driving.
+    running: root.bar !== null && root.tiles.length > 1 && !(root.opened && root.mode === "current")
     repeat: true
-    onTriggered: root.rotateIndex = (root.rotateIndex + 1) % Math.max(1, root.tiles.length)
+    onTriggered: root.rotateIndex = (root.safeIndex + 1) % Math.max(1, root.tiles.length)
   }
 
-  onOpenedChanged: if (opened) root.refresh()
+  onOpenedChanged: { if (opened) root.refresh(); else if (dirty) root.saveConfig() }
   Component.onCompleted: root.refresh()
 
   // First run after install: ask where the widget should live in the bar.

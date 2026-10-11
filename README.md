@@ -8,13 +8,15 @@ reshaped into a lightweight Omarchy shell bar-widget plugin.
 
 ## What it shows
 
-- **Bar:** a compact rotating score, e.g. `KC 24–17 LV` while live, `LAL@BOS`
-  before tip-off. Only your favourite teams appear. The colour tells the state:
-  accent = live, muted = final.
-- **Board (left click):** your favourite teams' live and upcoming games, with
-  the game clock and period/quarter/inning/frame (e.g. `2:52 - 4th`, `Top 5th`,
-  `72'`) and the date + time for upcoming games. Racing and golf show their
-  leaderboards.
+- **Bar:** one item per favourite team, in the order you added them, showing
+  that team's most relevant game (live, else next, else latest final) with
+  small logos, e.g. `[KC] KC 24–17 LV [LV]`. Favourite racing/golf follow, and
+  the league scoreboard(s) come last. Next/auto-rotation always use this same
+  order.
+- **Board (left click):** a large card for the game currently in the bar —
+  logos, abbreviations, score, game clock / start time, and a state badge
+  (live / today / later this week / final) — with Prev/Next to step through
+  the cycle. The "League scores" tab lists everything else.
 - **Settings (right click):** bar position, leagues, favourite teams (add and
   remove), per-team look-ahead days, racing drivers and golfers, and per-team
   bar colours.
@@ -58,7 +60,10 @@ the right-click panel. Highlights:
 | `days_ahead_teams` | Per-team look-ahead days, e.g. `{"football/nfl:KC": 21}` | `{}` |
 | `racing` | Drivers per racing league | `{}` |
 | `golf` | Golf players | `[]` |
-| `team_colors` | `"<league>:<ABBR>"` → `"#RRGGBB"` bar colour | `{}` |
+| `team_colors` | `"<league>:<ABBR>"` → `"#RRGGBB"` colour for that favourite team (bar + board) | `{}` |
+| `state_colors` | `live`, `today`, `this_week`, `final` → `"#RRGGBB"` | green / amber / blue / grey |
+| `bar_logos` | Show small team logos in the bar | `true` |
+| `cycle_leagues` | Add each selected league's scoreboard as the last item in the cycle | `true` |
 | `days_ahead` | Default look-ahead when a team has no override | `7` |
 | `days_back` | How far back to include finals | `1` |
 | `rotate_seconds` | Seconds per score in the bar | `6` |
