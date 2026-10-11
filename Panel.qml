@@ -28,11 +28,12 @@ Panel {
 
   property var config: root.defaultConfig()
   property var scores: ({})
-  property string mode: "scores"
+  property string mode: "current"
   property int rotateIndex: 0
   property bool loading: false
   property bool dirty: false
   property bool savePending: false
+  property int configRev: 0   // bumps when the config file is (re)loaded; text fields re-sync on it
   property bool refreshQueued: false
   property string statusText: ""
 
@@ -46,8 +47,14 @@ Panel {
     { key: "this_week", label: "Game later this week" },
     { key: "final", label: "Game over" }
   ]
+  readonly property string updatedText: {
+    var u = scores && scores.updated ? Date.parse(scores.updated) : NaN
+    return isNaN(u) ? "" : Qt.formatTime(new Date(u), "h:mm AP")
+  }
+  readonly property var swatchPalette: ["#E31837", "#F97316", "#F59E0B", "#22C55E", "#14B8A6", "#3B82F6",
+                                         "#6366F1", "#A855F7", "#EC4899", "#FFFFFF", "#9CA3AF", "#111827"]
   readonly property bool showBarLogos: config.bar_logos !== false
-  readonly property bool cycleLeagues: config.cycle_leagues !== false
+  readonly property bool cycleLeagues: config.league_in_cycle === true
 
   readonly property color fg: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(fg, 1.5)
@@ -72,7 +79,7 @@ Panel {
       max_games: 40,
       state_colors: {},
       bar_logos: true,
-      cycle_leagues: true,
+      league_in_cycle: false,
       position: "right",
       positioned: false
     }
@@ -117,6 +124,7 @@ Panel {
     var base = defaultConfig()
     for (var k in parsed) base[k] = parsed[k]
     config = base
+    configRev++
   }
 
   // Settings are written to ~/.config/auggment/scoreboard.json automatically
@@ -270,9 +278,8 @@ Panel {
         return d !== 0 ? d : String(a.start).localeCompare(String(b.start))
       })
       var live = list.filter(function(g) { return g.state === "in" }).length
-      // Make each game its own tile so the bar and opened view
-      // rotate through individual games instead of whole leagues.
-      for (var j = 0; j < list.length; j++) out.push(list[j])
+      out.push({ kind: "league", league_path: lp, league_label: list[0].league_label || Model.labelFor(lp),
+                 games: list, live: live, state: live > 0 ? "in" : "pre" })
     }
     return out
   }
@@ -346,6 +353,14 @@ Panel {
     return fallback
   }
 
+  // Left click -> current game, right click -> settings. Clicking the same
+  // view again closes the dropdown; clicking the other one just switches.
+  function showMode(m) {
+    if (opened && mode === m) { close(); return }
+    mode = m
+    if (!opened) open()
+  }
+
   function rotateNext() {
     if (tiles.length > 1) { rotateIndex = (safeIndex + 1) % tiles.length; rotateTimer.restart() }
   }
@@ -372,7 +387,7 @@ Panel {
 
   function barLabel() {
     var t = currentTile
-    if (!t) return loading ? "…" : "—"
+    if (!t) return loading ? "…" : ((config.teams || []).length === 0 ? "Pick teams" : "—")
     if (t.kind === "league") {
       return t.league_label + " · " + (t.live > 0 ? t.live + " live" : t.games.length + " games")
     }
@@ -432,10 +447,15 @@ Panel {
   function applyRacing(text) {
     var names = String(text || "").split(",").map(function(s) { return s.trim() }).filter(function(s) { return s.length > 0 })
     var dict = {}
-    var leagues = racingLeagues()
-    for (var i = 0; i < leagues.length; i++) dict[leagues[i]] = names
+    // Store the names under every racing series, not just the selected ones,
+    // so they are kept even if a series is selected later.
+    for (var i = 0; i < Model.LEAGUES.length; i++) {
+      if (Model.isRacing(Model.LEAGUES[i].path)) dict[Model.LEAGUES[i].path] = names
+    }
     setConfig("racing", dict)
   }
+  readonly property bool racingNamesMissingLeague: racingDriversText() !== "" && racingLeagues().length === 0
+  readonly property bool golfNamesMissingLeague: (config.golf || []).length > 0 && (config.leagues || []).indexOf("golf/pga") < 0
   function applyGolf(text) {
     var names = String(text || "").split(",").map(function(s) { return s.trim() }).filter(function(s) { return s.length > 0 })
     setConfig("golf", names)
@@ -453,7 +473,10 @@ Panel {
     Rectangle {
       anchors.fill: parent
       radius: Style.cornerRadius
-      color: barMouse.containsMouse ? Style.hoverFillFor(root.fg, Color.accent) : "transparent"
+      color: barMouse.containsMouse ? Style.hoverFillFor(root.fg, Color.accent)
+             : (root.currentTile ? Qt.rgba(root.currentColor.r, root.currentColor.g, root.currentColor.b, 0.18) : "transparent")
+      border.width: root.currentTile ? 1 : 0
+      border.color: Qt.rgba(root.currentColor.r, root.currentColor.g, root.currentColor.b, 0.6)
     }
 
     Row {
@@ -527,9 +550,14 @@ Panel {
       hoverEnabled: true
       acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
       onPressed: function(mouse) {
-        if (mouse.button === Qt.RightButton) { root.mode = "settings"; root.open() }
+        if (mouse.button === Qt.RightButton) root.showMode("settings")
         else if (mouse.button === Qt.MiddleButton) root.refresh()
-        else { root.mode = "current"; root.toggle() }
+        else root.showMode("current")
+      }
+      // Scroll over the bar item to step through games without opening it.
+      onWheel: function(wheel) {
+        if (wheel.angleDelta.y > 0) root.rotatePrev()
+        else if (wheel.angleDelta.y < 0) root.rotateNext()
       }
     }
   }
@@ -540,7 +568,7 @@ Panel {
     function close(): void { root.close() }
     function show(): void { root.open() }
     function hide(): void { root.close() }
-    function toggle(): void { root.toggle() }
+    function toggle(): void { root.showMode("current") }
     function scores(): void { root.mode = "scores"; root.open() }
     function current(): void { root.mode = "current"; root.open() }
     function next(): void { root.rotateNext() }
@@ -611,14 +639,14 @@ Panel {
             spacing: Style.space(6)
 
             Button {
-              text: "Current game"
+              text: "Game"
               selected: root.mode === "current"
               foreground: root.fg
               fontFamily: root.fontFamily
               onClicked: root.mode = "current"
             }
             Button {
-              text: "League scores"
+              text: "Scores"
               selected: root.mode === "scores"
               foreground: root.fg
               fontFamily: root.fontFamily
@@ -639,7 +667,7 @@ Panel {
             }
             Item { Layout.fillWidth: true }
             Button {
-              text: root.loading ? "…" : "Refresh"
+              text: root.loading ? "…" : "⟳"
               foreground: root.fg
               fontFamily: root.fontFamily
               onClicked: root.refresh()
@@ -681,7 +709,7 @@ Panel {
             Text {
               width: parent.width
               visible: !root.currentTile
-              text: root.loading ? "Loading…" : "Nothing to show yet. Add teams in Settings."
+              text: root.loading ? "Loading…" : "No favorite teams yet. Open Settings to pick leagues and favorites."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
@@ -705,10 +733,10 @@ Panel {
 
             RowLayout {
               width: parent.width
-              visible: root.tiles.length > 1
               spacing: Style.space(8)
 
               Button {
+                visible: root.tiles.length > 1
                 text: "◂ Prev"
                 foreground: root.fg
                 fontFamily: root.fontFamily
@@ -718,17 +746,33 @@ Panel {
                 Layout.fillWidth: true
                 horizontalAlignment: Text.AlignHCenter
                 elide: Text.ElideRight
-                text: (root.safeIndex + 1) + " / " + root.tiles.length + "  ·  " + root.tileTitle(root.currentTile)
+                text: root.tiles.length > 0 ? (root.safeIndex + 1) + " / " + root.tiles.length + "  ·  " + root.tileTitle(root.currentTile) : ""
                 color: root.dim
                 font.family: root.fontFamily
                 font.pixelSize: Style.font.caption
               }
               Button {
+                visible: root.tiles.length > 1
                 text: "Next ▸"
                 foreground: root.fg
                 fontFamily: root.fontFamily
                 onClicked: root.rotateNext()
               }
+              Button {
+                text: root.loading ? "Refreshing…" : "⟳ Refresh"
+                foreground: root.fg
+                fontFamily: root.fontFamily
+                onClicked: root.refresh()
+              }
+            }
+            Text {
+              width: parent.width
+              horizontalAlignment: Text.AlignHCenter
+              visible: root.updatedText !== ""
+              text: "Updated " + root.updatedText
+              color: root.dim
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
             }
           }
 
@@ -833,6 +877,13 @@ Panel {
               spacing: Style.space(8)
 
               PanelSectionHeader { text: "FAVORITE TEAMS"; foreground: root.fg; fontFamily: root.fontFamily }
+              Button {
+                visible: (root.config.teams || []).length > 0
+                text: "Clear all favorites"
+                foreground: root.fg
+                fontFamily: root.fontFamily
+                onClicked: { root.setConfig("teams", []); root.setConfig("days_ahead_teams", {}) }
+              }
               MultiSelect {
                 width: parent.width
                 label: "Teams"
@@ -906,16 +957,46 @@ Panel {
                 width: parent.width
                 placeholderText: "Racing drivers (e.g. Larson, Verstappen)"
                 foreground: root.fg
-                text: root.racingDriversText()
+                Component.onCompleted: text = root.racingDriversText()
+                Connections {
+                  target: root
+                  function onConfigRevChanged() { racingField.text = root.racingDriversText() }
+                  function onOpenedChanged() { if (root.opened) racingField.text = root.racingDriversText() }
+                }
+                onTextEdited: root.applyRacing(text)
                 onEditingFinished: root.applyRacing(text)
+              }
+              Text {
+                width: parent.width
+                visible: root.racingNamesMissingLeague
+                text: "Saved, but no racing series is selected. Add NASCAR, IndyCar or Formula 1 under Leagues to see them."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
               }
               TextField {
                 id: golfField
                 width: parent.width
                 placeholderText: "Golf players (e.g. Scheffler)"
                 foreground: root.fg
-                text: (root.config.golf || []).join(", ")
+                Component.onCompleted: text = (root.config.golf || []).join(", ")
+                Connections {
+                  target: root
+                  function onConfigRevChanged() { golfField.text = (root.config.golf || []).join(", ") }
+                  function onOpenedChanged() { if (root.opened) golfField.text = (root.config.golf || []).join(", ") }
+                }
+                onTextEdited: root.applyGolf(text)
                 onEditingFinished: root.applyGolf(text)
+              }
+              Text {
+                width: parent.width
+                visible: root.golfNamesMissingLeague
+                text: "Saved, but PGA Tour is not selected under Leagues."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
               }
             }
 
@@ -935,8 +1016,12 @@ Panel {
               }
               Repeater {
                 model: root.config.teams || []
-                delegate: RowLayout {
+                delegate: Column {
+                  id: teamColorRow
                   required property string modelData
+                  width: parent.width
+                  spacing: Style.space(4)
+                  RowLayout {
                   width: parent.width
                   spacing: Style.space(8)
 
@@ -957,11 +1042,17 @@ Panel {
                     elide: Text.ElideRight
                   }
                   TextField {
+                    id: teamHex
                     Layout.preferredWidth: Style.space(110)
                     placeholderText: "#RRGGBB"
                     foreground: root.fg
-                    text: (root.config.team_colors || {})[modelData] || ""
-                    onEditingFinished: root.setColorMap("team_colors", modelData, text)
+                    text: (root.config.team_colors || {})[teamColorRow.modelData] || ""
+                    onEditingFinished: root.setColorMap("team_colors", teamColorRow.modelData, text)
+                  }
+                  }
+                  Swatches {
+                    width: parent.width
+                    onPicked: function(hex) { teamHex.text = hex; root.setColorMap("team_colors", teamColorRow.modelData, hex) }
                   }
                 }
               }
@@ -982,8 +1073,12 @@ Panel {
               }
               Repeater {
                 model: root.stateColorRows
-                delegate: RowLayout {
+                delegate: Column {
+                  id: stateColorRow
                   required property var modelData
+                  width: parent.width
+                  spacing: Style.space(4)
+                  RowLayout {
                   width: parent.width
                   spacing: Style.space(8)
 
@@ -1004,11 +1099,17 @@ Panel {
                     elide: Text.ElideRight
                   }
                   TextField {
+                    id: stateHex
                     Layout.preferredWidth: Style.space(110)
-                    placeholderText: root.defaultStateColors[modelData.key]
+                    placeholderText: root.defaultStateColors[stateColorRow.modelData.key]
                     foreground: root.fg
-                    text: (root.config.state_colors || {})[modelData.key] || ""
-                    onEditingFinished: root.setColorMap("state_colors", modelData.key, text)
+                    text: (root.config.state_colors || {})[stateColorRow.modelData.key] || ""
+                    onEditingFinished: root.setColorMap("state_colors", stateColorRow.modelData.key, text)
+                  }
+                  }
+                  Swatches {
+                    width: parent.width
+                    onPicked: function(hex) { stateHex.text = hex; root.setColorMap("state_colors", stateColorRow.modelData.key, hex) }
                   }
                 }
               }
@@ -1030,11 +1131,11 @@ Panel {
                   onClicked: root.setConfig("bar_logos", !root.showBarLogos)
                 }
                 Button {
-                  text: "League at end: " + (root.cycleLeagues ? "On" : "Off")
+                  text: "League last in cycle: " + (root.cycleLeagues ? "On" : "Off")
                   selected: root.cycleLeagues
                   foreground: root.fg
                   fontFamily: root.fontFamily
-                  onClicked: root.setConfig("cycle_leagues", !root.cycleLeagues)
+                  onClicked: root.setConfig("league_in_cycle", !root.cycleLeagues)
                 }
                 Item { Layout.fillWidth: true }
               }
@@ -1045,6 +1146,12 @@ Panel {
             RowLayout {
               width: parent.width
               spacing: Style.space(8)
+              Button {
+                text: root.loading ? "Refreshing…" : "⟳ Refresh"
+                foreground: root.fg
+                fontFamily: root.fontFamily
+                onClicked: root.refresh()
+              }
               Item { Layout.fillWidth: true }
               Button {
                 text: root.dirty ? "Save now" : "Saved"
@@ -1066,6 +1173,30 @@ Panel {
   // -------------------------------------------------------------------------
   // Large "current game" card
   // -------------------------------------------------------------------------
+  component Swatches: Flow {
+    id: sw
+    signal picked(string hex)
+    spacing: Style.space(5)
+    Repeater {
+      model: root.swatchPalette
+      delegate: Rectangle {
+        id: chip
+        required property string modelData
+        width: Style.space(16)
+        height: Style.space(16)
+        radius: 4
+        color: chip.modelData
+        border.width: 1
+        border.color: root.dim
+        MouseArea {
+          anchors.fill: parent
+          cursorShape: Qt.PointingHandCursor
+          onClicked: sw.picked(chip.modelData)
+        }
+      }
+    }
+  }
+
   component TeamBlock: Column {
     id: tb
     property var side: null
@@ -1095,6 +1226,17 @@ Panel {
       font.pixelSize: Style.font.display
       font.bold: true
     }
+    Item {
+      width: parent.width
+      height: Style.space(3)
+      Rectangle {
+        anchors.centerIn: parent
+        width: Style.space(40)
+        height: parent.height
+        radius: height / 2
+        color: root.teamColor(tb.side, "transparent")
+      }
+    }
     Text {
       width: parent.width
       horizontalAlignment: Text.AlignHCenter
@@ -1116,7 +1258,7 @@ Panel {
     implicitHeight: bigCol.implicitHeight + Style.space(28)
     height: implicitHeight
     radius: Style.cornerRadius * 2
-    color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.06)
+    color: Qt.rgba(big.catColor.r, big.catColor.g, big.catColor.b, 0.10)
     border.width: 2
     border.color: big.catColor
 
@@ -1186,7 +1328,7 @@ Panel {
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
             text: !big.game ? "" : (big.game.state === "pre" ? "@" : big.game.away.score + " – " + big.game.home.score)
-            color: root.fg
+            color: big.catColor
             font.family: root.fontFamily
             font.pixelSize: Math.round(Style.font.display * 1.6)
             font.bold: true
