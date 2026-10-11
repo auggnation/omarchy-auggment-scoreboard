@@ -686,6 +686,13 @@ Panel {
   }
 
   Process {
+    id: ensureProc
+    running: true
+    command: ["python3", root.saveConfigScript, "--ensure"]
+    onRunningChanged: if (!running) configFile.reload()
+  }
+
+  Process {
     id: fetchProc
     command: ["python3", root.fetchScript]
     stdout: StdioCollector {
