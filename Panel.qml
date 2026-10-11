@@ -38,6 +38,9 @@ Panel {
   readonly property color dim: Qt.darker(fg, 1.5)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
+
   function defaultConfig() {
     return {
       timezone: "America/Chicago",
