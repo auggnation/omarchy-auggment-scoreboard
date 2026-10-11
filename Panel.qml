@@ -93,14 +93,21 @@ Panel {
     var data = scores || {}
     var out = []
     var games = data.games || []
-    for (var i = 0; i < games.length && out.length < 30; i++) out.push(games[i])
+    for (var i = 0; i < games.length && out.length < 30; i++) if (games[i].is_fav) out.push(games[i])
     var races = data.races || []
-    for (var j = 0; j < races.length && out.length < 30; j++) out.push(races[j])
+    for (var j = 0; j < races.length && out.length < 30; j++) if (races[j].is_fav) out.push(races[j])
     var golf = data.golf || []
-    for (var g = 0; g < golf.length && out.length < 30; g++) out.push(golf[g])
+    for (var g = 0; g < golf.length && out.length < 30; g++) if (golf[g].is_fav) out.push(golf[g])
     return out
   }
   readonly property var currentTile: tiles.length > 0 ? tiles[rotateIndex % tiles.length] : null
+  readonly property bool hasFavorites: {
+    if ((config.teams || []).length > 0) return true
+    if ((config.golf || []).length > 0) return true
+    var racing = config.racing || {}
+    for (var k in racing) if ((racing[k] || []).length > 0) return true
+    return false
+  }
 
   function stateColor(state) {
     if (state === "in") return Color.accent

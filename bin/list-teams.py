@@ -7,8 +7,12 @@ Standard library only.
 """
 
 import json
+import os
 import sys
 from urllib import request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import leagues  # noqa: E402  (shared source metadata; see bin/leagues.py)
 
 # Slugs where the league path segment differs from ESPN's sport/league slugs.
 SLUG_OVERRIDES = {
@@ -31,6 +35,12 @@ def main():
         print(json.dumps([]))
         return
     path = sys.argv[1]
+    if leagues.source_for(path) == "tsdb":
+        out = [{"abbr": t["abbr"], "name": t["name"], "logo": "", "color": ""}
+               for t in leagues.TSDB_TEAMS.get(path, [])]
+        out.sort(key=lambda x: x["name"].lower())
+        print(json.dumps(out))
+        return
     sport, league = SLUG_OVERRIDES.get(path, (path.split("/")[0], path.split("/")[-1]))
     host = "site.web.api.espn.com" if path in WEB_API_LEAGUES else "site.api.espn.com"
     url = f"https://{host}/apis/site/v2/sports/{sport}/{league}/teams?limit=500"

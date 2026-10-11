@@ -8,8 +8,12 @@ Prints JSON: [{"value": "football/nfl:KC", "label": "Kansas City Chiefs (NFL)",
 """
 
 import json
+import os
 import sys
 from urllib import request
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import leagues  # noqa: E402  (shared source metadata; see bin/leagues.py)
 
 SLUG_OVERRIDES = {
     "softball/college-softball": ("baseball", "college-softball"),
@@ -59,6 +63,18 @@ def main():
     seen = set()
     for path in paths:
         label = LABELS.get(path, path.split("/")[-1].upper())
+        if leagues.source_for(path) == "tsdb":
+            for t in leagues.TSDB_TEAMS.get(path, []):
+                value = f"{path}:{t['abbr']}"
+                if value in seen:
+                    continue
+                seen.add(value)
+                out.append({
+                    "value": value,
+                    "label": f"{t['name']} ({t['abbr']})",
+                    "description": label,
+                })
+            continue
         for t in teams_for(path):
             team = t.get("team", {})
             abbr = team.get("abbreviation")

@@ -31,6 +31,9 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from urllib import request, error
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import leagues  # noqa: E402  (shared source metadata; see bin/leagues.py)
+
 try:
     from zoneinfo import ZoneInfo
 except Exception:  # pragma: no cover
@@ -121,6 +124,9 @@ LEAGUE_LABELS = {
 
 USER_AGENT = "AuggmentScoreboard/1.0 (+https://github.com/auggnation/omarchy-auggment-scoreboard)"
 
+# TheSportsDB free v1 API (the "3" key is their documented free test key).
+TSDB_BASE = "https://www.thesportsdb.com/api/v1/json/3"
+
 
 def http_json(url, timeout=8):
     req = request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
@@ -198,8 +204,47 @@ def fetch_league(path, days_back, days_ahead):
     return events
 
 
+def fetch_tsdb(path, days_back, days_ahead):
+    """Fetch a league from TheSportsDB (used for leagues ESPN does not carry).
+
+    Combines the next and previous fixtures for the league and keeps only the
+    ones inside the look-back / look-ahead window.
+    """
+    lid = leagues.TSDB_LEAGUE_IDS.get(path)
+    if not lid:
+        return []
+    events = {}
+    for endpoint in ("eventsnextleague.php", "eventspastleague.php"):
+        try:
+            data = http_json(f"{TSDB_BASE}/{endpoint}?id={lid}")
+        except Exception:
+            continue
+        for e in data.get("events") or []:
+            eid = e.get("idEvent")
+            if eid and eid not in events:
+                events[eid] = e
+
+    now = datetime.now(timezone.utc)
+    lo = (now - timedelta(days=days_back)).date()
+    hi = (now + timedelta(days=max(days_ahead, 1))).date()
+    out = []
+    for e in events.values():
+        ts = e.get("strTimestamp") or ""
+        try:
+            d = datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
+        except Exception:
+            out.append(e)
+            continue
+        if lo <= d <= hi:
+            out.append(e)
+    out.sort(key=lambda e: e.get("strTimestamp") or "")
+    return out
+
+
 def _safe_fetch(path, days_back, days_ahead):
     try:
+        if leagues.source_for(path) == "tsdb":
+            return fetch_tsdb(path, days_back, days_ahead)
         return fetch_league(path, days_back, days_ahead)
     except Exception:
         return []
@@ -291,6 +336,98 @@ def parse_team_game(path, event, cfg_favs, cfg_colors, tz):
     }
 
 
+def parse_tsdb_game(path, event, cfg_favs, cfg_colors, tz):
+    """Map a TheSportsDB event to the same shape as parse_team_game."""
+    def side(home_away):
+        if home_away == "home":
+            name = event.get("strHomeTeam") or "?"
+            tid = event.get("idHomeTeam")
+            raw_score = event.get("intHomeScore")
+            logo = event.get("strHomeTeamBadge") or ""
+        else:
+            name = event.get("strAwayTeam") or "?"
+            tid = event.get("idAwayTeam")
+            raw_score = event.get("intAwayScore")
+            logo = event.get("strAwayTeamBadge") or ""
+        abbr = leagues.tsdb_abbr(tid, name)
+        key = f"{path.lower()}:{abbr.upper()}"
+        try:
+            score = int(raw_score)
+        except Exception:
+            score = 0
+        return {
+            "abbr": abbr,
+            "name": name,
+            "short_name": abbr,
+            "score": score,
+            "logo": logo,
+            "color": team_color(None, cfg_colors.get(key)),
+            "fav": key in cfg_favs,
+            "winner": False,
+            "home_away": home_away,
+        }
+
+    a = side("away")
+    h = side("home")
+
+    status = (event.get("strStatus") or "NS").upper()
+    if status in ("FT", "AET", "PEN", "FINAL", "AFTER EXTRA TIME"):
+        state = "post"
+    elif status in ("NS", "TBD", "POSTPONED", "POSTP", "CANCELED", "CANC", "PST", "SUSP"):
+        state = "pre"
+    else:
+        state = "in"
+
+    winner = None
+    if state == "post":
+        if a["score"] > h["score"]:
+            winner = "away"
+            a["winner"] = True
+        elif h["score"] > a["score"]:
+            winner = "home"
+            h["winner"] = True
+        else:
+            winner = "tie"
+
+    start = event.get("strTimestamp") or ""
+    start_local = start_full = ""
+    try:
+        dt = datetime.fromisoformat(start.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        dt = dt.astimezone(tz)
+        start_local = dt.strftime("%a %-I:%M %p")
+        start_full = dt.strftime("%a %b %-d, %-I:%M %p")
+    except Exception:
+        pass
+
+    if state == "in":
+        detail = event.get("strProgress") or "LIVE"
+    elif state == "post":
+        detail = "Final"
+    else:
+        detail = start_full or (event.get("strTime") or "")
+
+    return {
+        "kind": "game",
+        "league_path": path,
+        "league_label": LEAGUE_LABELS.get(path, path.split("/")[-1].upper()),
+        "state": state,
+        "detail": detail,
+        "clock": "",
+        "period": int(event.get("intRound") or 0) if str(event.get("intRound") or "").isdigit() else 0,
+        "start": start,
+        "start_local": start_local,
+        "start_full": start_full,
+        "name": event.get("strEvent") or "",
+        "link": "",
+        "away": a,
+        "home": h,
+        "is_fav": a["fav"] or h["fav"],
+        "winner": winner,
+    }
+
+
 def parse_race(path, event, fav_names, allowed):
     status = event.get("status", {})
     stype = status.get("type", {})
@@ -337,6 +474,7 @@ def parse_race(path, event, fav_names, allowed):
         "name": event.get("shortName") or event.get("name", "Race"),
         "state": stype.get("state", "pre"),
         "detail": stype.get("shortDetail", "") or stype.get("detail", ""),
+        "is_fav": any(d.get("fav") for d in drivers),
         "drivers": drivers,
     }
 
@@ -390,6 +528,7 @@ def parse_golf(path, event, fav_names):
         "name": event.get("shortName") or event.get("name", "Tournament"),
         "state": stype.get("state", "pre"),
         "detail": stype.get("shortDetail", "") or stype.get("detail", ""),
+        "is_fav": any(g.get("fav") for g in golfers),
         "golfers": golfers,
     }
 
@@ -409,9 +548,9 @@ def build(cfg):
     golf_favs = [str(n).strip().lower() for n in cfg.get("golf", []) if str(n).strip()]
 
     games, races, golf = [], [], []
-    leagues = [p for p in cfg.get("leagues", []) if isinstance(p, str)]
-    with ThreadPoolExecutor(max_workers=min(8, max(1, len(leagues)))) as pool:
-        fetched = list(pool.map(lambda p: (p, _safe_fetch(p, days_back, days_ahead)), leagues))
+    league_paths = [p for p in cfg.get("leagues", []) if isinstance(p, str)]
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(league_paths)))) as pool:
+        fetched = list(pool.map(lambda p: (p, _safe_fetch(p, days_back, days_ahead)), league_paths))
     for path, events in fetched:
         for event in events:
             try:
@@ -420,6 +559,10 @@ def build(cfg):
                     races.append(parse_race(path, event, favs, MOTORSPORTS_LEAGUES))
                 elif path in GOLF_LEAGUES:
                     golf.append(parse_golf(path, event, golf_favs))
+                elif leagues.source_for(path) == "tsdb":
+                    g = parse_tsdb_game(path, event, fav_set, colors, tz)
+                    if g:
+                        games.append(g)
                 else:
                     g = parse_team_game(path, event, fav_set, colors, tz)
                     if g:
