@@ -9,15 +9,36 @@ import "Model.js" as Model
 
 // Auggment Scoreboard — a lightweight live-scores bar widget.
 //
-// Left click opens the scores view (rotating through your favorites), right
-// click opens settings, middle click refreshes now. Scores come from ESPN via
-// the bundled bin/fetch-scores.py; the config lives at
+// Loaded by BarWidget.qml (the manifest entry point). BarWidget draws the bar
+// item and forwards clicks here (left = game view, right = settings, middle =
+// refresh); this file owns the data, rotation and the popup. Scores come from
+// ESPN / TheSportsDB via bin/fetch-scores.py; the config lives at
 // ~/.config/auggment/scoreboard.json.
 Panel {
   id: root
   moduleName: "io.github.auggnation.auggment-scoreboard"
   ipcTarget: "io.github.auggnation.auggment-scoreboard"
   manageIpc: false
+
+  // Injected by BarWidget.qml.
+  property var anchorItem: null
+  property var hostWidget: null
+
+  function open() { root.controller.show() }
+  function close() { root.controller.hide() }
+
+  function switchPanel(direction) {
+    if (root.bar && typeof root.bar.switchPanelFrom === "function")
+      return root.bar.switchPanelFrom(root.hostWidget || root, direction)
+    return false
+  }
+
+  // Clicking the view that is already open closes the popup; otherwise switch.
+  function showMode(m) {
+    if (opened && mode === m) { close(); return }
+    mode = m
+    if (!opened) open()
+  }
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string configPath: home + "/.config/auggment/scoreboard.json"
@@ -28,17 +49,13 @@ Panel {
 
   property var config: root.defaultConfig()
   property var scores: ({})
-  property string mode: "current"
+  property string mode: "scores"
   property int rotateIndex: 0
   property bool loading: false
   property bool dirty: false
   property bool savePending: false
-  readonly property string buildTag: "7"
-  property string lastSaved: ""
-  property double lastClosedAt: 0
-  property string lastClosedMode: ""
-  property int configRev: 0   // bumps when the config file is (re)loaded; text fields re-sync on it
   property bool refreshQueued: false
+  property bool configLoadedOnce: false
   property string statusText: ""
 
   // Colours for the four game states; overridable via config.state_colors.
@@ -55,17 +72,12 @@ Panel {
     var u = scores && scores.updated ? Date.parse(scores.updated) : NaN
     return isNaN(u) ? "" : Qt.formatTime(new Date(u), "h:mm AP")
   }
-  readonly property var swatchPalette: ["#E31837", "#F97316", "#F59E0B", "#22C55E", "#14B8A6", "#3B82F6",
-                                         "#6366F1", "#A855F7", "#EC4899", "#FFFFFF", "#9CA3AF", "#111827"]
   readonly property bool showBarLogos: config.bar_logos !== false
-  readonly property bool cycleLeagues: config.league_in_cycle === true
+  readonly property bool cycleLeagues: config.cycle_leagues !== false
 
   readonly property color fg: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(fg, 1.5)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
-
-  implicitWidth: button.implicitWidth
-  implicitHeight: button.implicitHeight
 
   function defaultConfig() {
     return {
@@ -83,7 +95,7 @@ Panel {
       max_games: 40,
       state_colors: {},
       bar_logos: true,
-      league_in_cycle: false,
+      cycle_leagues: true,
       position: "right",
       positioned: false
     }
@@ -128,7 +140,7 @@ Panel {
     var base = defaultConfig()
     for (var k in parsed) base[k] = parsed[k]
     config = base
-    configRev++
+    if (!configLoadedOnce) { configLoadedOnce = true; refresh() }
   }
 
   // Settings are written to ~/.config/auggment/scoreboard.json automatically
@@ -174,9 +186,11 @@ Panel {
 
   function teamAhead(key) {
     var overrides = config.days_ahead_teams || {}
-    var v = overrides[key]
+    var want = normKey(key)
+    var v
+    for (var k in overrides) if (normKey(k) === want) { v = overrides[k]; break }
     if (v === undefined || v === null || v === "") return (config.days_ahead || 7)
-    return v
+    return Number(v)
   }
 
   function setTeamAhead(key, value) {
@@ -187,11 +201,18 @@ Panel {
     setConfig("days_ahead_teams", overrides)
   }
 
+  // Whole calendar days from today (local time) to the game's date: 0 = today,
+  // 1 = tomorrow. Counting calendar days (not 24h blocks) means a game on the
+  // last day of the window is no longer dropped because of its kick-off time.
   function daysUntil(iso) {
     if (!iso) return 0
     var t = Date.parse(iso)
     if (isNaN(t)) return 0
-    return Math.ceil((t - Date.now()) / 86400000)
+    var g = new Date(t)
+    var n = new Date()
+    var gd = new Date(g.getFullYear(), g.getMonth(), g.getDate())
+    var nd = new Date(n.getFullYear(), n.getMonth(), n.getDate())
+    return Math.round((gd.getTime() - nd.getTime()) / 86400000)
   }
 
   function gameVisible(g) {
@@ -247,23 +268,6 @@ Panel {
     return a.state === "post" ? ta > tb : ta < tb
   }
 
-  // A favourite team with no game inside its look-ahead window still gets a
-  // slide, so a team you add always appears right away.
-  function teamPlaceholder(key) {
-    var favs = (scores && scores.favorites) || []
-    var f = null
-    for (var i = 0; i < favs.length; i++) if (favs[i].key === key) { f = favs[i]; break }
-    var idx = key.lastIndexOf(":")
-    var lp = key.substring(0, idx)
-    var abbr = key.substring(idx + 1)
-    return {
-      kind: "team", fav: true, state: "pre", team_key: key, league_path: lp,
-      league_label: f ? f.league_label : Model.labelFor(lp),
-      abbr: abbr, name: f ? f.name : abbr, logo: f ? f.logo : "",
-      color: (f && f.color) ? f.color : "", days: teamAhead(key)
-    }
-  }
-
   function favoriteGameTiles() {
     var games = (scores && scores.games) || []
     var teams = config.teams || []
@@ -280,8 +284,6 @@ Panel {
       if (best) {
         var id = best.league_path + "|" + best.name + "|" + best.start
         if (!seen[id]) { seen[id] = true; out.push(best) }
-      } else {
-        out.push(teamPlaceholder(key))
       }
     }
     return out
@@ -352,7 +354,6 @@ Panel {
     if (!t) return "this_week"
     if (t.kind === "game") return gameCategory(t)
     if (t.kind === "league") return t.live > 0 ? "live" : "this_week"
-    if (t.kind === "team") return "final"
     if (t.state === "in") return "live"
     if (t.state === "post") return "final"
     return "this_week"
@@ -377,17 +378,6 @@ Panel {
     return fallback
   }
 
-  // Left click -> current game, right click -> settings. Clicking the same
-  // view again closes the dropdown; clicking the other one just switches.
-  function showMode(m) {
-    if (opened && mode === m) { close(); return }
-    // The panel can close itself on the press that reaches us (click-away);
-    // treat that press as the "close" click instead of reopening.
-    if (!opened && lastClosedMode === m && (Date.now() - lastClosedAt) < 350) return
-    mode = m
-    if (!opened) open()
-  }
-
   function rotateNext() {
     if (tiles.length > 1) { rotateIndex = (safeIndex + 1) % tiles.length; rotateTimer.restart() }
   }
@@ -399,7 +389,6 @@ Panel {
   function tileTitle(t) {
     if (!t) return ""
     if (t.kind === "league") return t.league_label + " scoreboard"
-    if (t.kind === "team") return t.name
     if (t.kind === "game") {
       var s = (t.away && t.away.fav) ? t.away : ((t.home && t.home.fav) ? t.home : null)
       return s ? s.name : (t.away.abbr + " @ " + t.home.abbr)
@@ -415,11 +404,10 @@ Panel {
 
   function barLabel() {
     var t = currentTile
-    if (!t) return loading ? "…" : ((config.teams || []).length === 0 ? "Pick teams" : "—")
+    if (!t) return loading ? "…" : ((config.teams || []).length === 0 ? "Pick teams" : "No games")
     if (t.kind === "league") {
       return t.league_label + " · " + (t.live > 0 ? t.live + " live" : t.games.length + " games")
     }
-    if (t.kind === "team") return t.abbr + " · no game"
     if (t.kind === "race" || t.kind === "golf") {
       var d = String(t.detail || "")
       if (d.length > 10) d = d.substring(0, 10)
@@ -476,119 +464,13 @@ Panel {
   function applyRacing(text) {
     var names = String(text || "").split(",").map(function(s) { return s.trim() }).filter(function(s) { return s.length > 0 })
     var dict = {}
-    // Store the names under every racing series, not just the selected ones,
-    // so they are kept even if a series is selected later.
-    for (var i = 0; i < Model.LEAGUES.length; i++) {
-      if (Model.isRacing(Model.LEAGUES[i].path)) dict[Model.LEAGUES[i].path] = names
-    }
+    var leagues = racingLeagues()
+    for (var i = 0; i < leagues.length; i++) dict[leagues[i]] = names
     setConfig("racing", dict)
   }
-  readonly property bool racingNamesMissingLeague: racingDriversText() !== "" && racingLeagues().length === 0
-  readonly property bool golfNamesMissingLeague: (config.golf || []).length > 0 && (config.leagues || []).indexOf("golf/pga") < 0
   function applyGolf(text) {
     var names = String(text || "").split(",").map(function(s) { return s.trim() }).filter(function(s) { return s.length > 0 })
     setConfig("golf", names)
-  }
-
-  // -------------------------------------------------------------------------
-  // Bar button
-  // -------------------------------------------------------------------------
-  Item {
-    id: button
-    anchors.fill: parent
-    implicitWidth: barRow.implicitWidth + Style.space(12)
-    implicitHeight: Math.max(barRow.implicitHeight, Style.space(16)) + Style.space(8)
-
-    Rectangle {
-      anchors.fill: parent
-      radius: Style.cornerRadius
-      color: barMouse.containsMouse ? Style.hoverFillFor(root.fg, Color.accent)
-             : (root.currentTile ? Qt.rgba(root.currentColor.r, root.currentColor.g, root.currentColor.b, 0.18) : "transparent")
-      border.width: root.currentTile ? 1 : 0
-      border.color: Qt.rgba(root.currentColor.r, root.currentColor.g, root.currentColor.b, 0.6)
-    }
-
-    Row {
-      id: barRow
-      anchors.centerIn: parent
-      spacing: Style.space(5)
-
-      // ---- game tile: [logo] AWAY 24–17 HOME [logo] ----
-      Image {
-        visible: root.showBarLogos && !!root.barGame && !!root.barGame.away.logo
-        width: Style.space(16); height: Style.space(16)
-        anchors.verticalCenter: parent.verticalCenter
-        fillMode: Image.PreserveAspectFit
-        asynchronous: true
-        smooth: true
-        sourceSize.width: 48; sourceSize.height: 48
-        source: visible ? root.barGame.away.logo : ""
-      }
-      Text {
-        visible: !!root.barGame
-        anchors.verticalCenter: parent.verticalCenter
-        text: root.barGame ? root.barGame.away.abbr : ""
-        color: root.teamColor(root.barGame ? root.barGame.away : null, root.fg)
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        font.bold: true
-      }
-      Text {
-        visible: !!root.barGame
-        anchors.verticalCenter: parent.verticalCenter
-        text: !root.barGame ? "" : (root.barGame.state === "pre" ? "@" : root.barGame.away.score + "–" + root.barGame.home.score)
-        color: root.currentColor
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        font.bold: true
-      }
-      Text {
-        visible: !!root.barGame
-        anchors.verticalCenter: parent.verticalCenter
-        text: root.barGame ? root.barGame.home.abbr : ""
-        color: root.teamColor(root.barGame ? root.barGame.home : null, root.fg)
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        font.bold: true
-      }
-      Image {
-        visible: root.showBarLogos && !!root.barGame && !!root.barGame.home.logo
-        width: Style.space(16); height: Style.space(16)
-        anchors.verticalCenter: parent.verticalCenter
-        fillMode: Image.PreserveAspectFit
-        asynchronous: true
-        smooth: true
-        sourceSize.width: 48; sourceSize.height: 48
-        source: visible ? root.barGame.home.logo : ""
-      }
-
-      // ---- league / race / golf tile, or nothing to show ----
-      Text {
-        visible: !root.barGame
-        anchors.verticalCenter: parent.verticalCenter
-        text: root.barLabel()
-        color: root.currentColor
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-      }
-    }
-
-    MouseArea {
-      id: barMouse
-      anchors.fill: parent
-      hoverEnabled: true
-      acceptedButtons: Qt.LeftButton | Qt.RightButton | Qt.MiddleButton
-      onPressed: function(mouse) {
-        if (mouse.button === Qt.RightButton) root.showMode("settings")
-        else if (mouse.button === Qt.MiddleButton) root.refresh()
-        else root.showMode("current")
-      }
-      // Scroll over the bar item to step through games without opening it.
-      onWheel: function(wheel) {
-        if (wheel.angleDelta.y > 0) root.rotatePrev()
-        else if (wheel.angleDelta.y < 0) root.rotateNext()
-      }
-    }
   }
 
   IpcHandler {
@@ -611,8 +493,8 @@ Panel {
   // -------------------------------------------------------------------------
   KeyboardPanel {
     id: panel
-    anchorItem: button
-    owner: root
+    anchorItem: root.anchorItem
+    owner: root.hostWidget || root
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
@@ -668,14 +550,14 @@ Panel {
             spacing: Style.space(6)
 
             Button {
-              text: "Game"
+              text: "Current game"
               selected: root.mode === "current"
               foreground: root.fg
               fontFamily: root.fontFamily
               onClicked: root.mode = "current"
             }
             Button {
-              text: "Scores"
+              text: "League scores"
               selected: root.mode === "scores"
               foreground: root.fg
               fontFamily: root.fontFamily
@@ -696,7 +578,7 @@ Panel {
             }
             Item { Layout.fillWidth: true }
             Button {
-              text: root.loading ? "…" : "⟳"
+              text: root.loading ? "…" : "Refresh"
               foreground: root.fg
               fontFamily: root.fontFamily
               onClicked: root.refresh()
@@ -738,7 +620,7 @@ Panel {
             Text {
               width: parent.width
               visible: !root.currentTile
-              text: root.loading ? "Loading…" : "No favorite teams yet. Open Settings to pick leagues and favorites."
+              text: root.loading ? "Loading…" : (root.hasFavorites ? "None of your teams have a game in their look-ahead window. Raise a team's look-ahead in Settings to look further out." : "No favorite teams yet. Open Settings to pick leagues and favorites.")
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
@@ -748,26 +630,6 @@ Panel {
             BigGame {
               visible: !!root.currentTile && root.currentTile.kind === "game"
               game: (root.currentTile && root.currentTile.kind === "game") ? root.currentTile : null
-            }
-            Column {
-              width: parent.width
-              spacing: Style.space(8)
-              visible: !!root.currentTile && root.currentTile.kind === "team"
-              TeamBlock {
-                width: parent.width
-                side: (root.currentTile && root.currentTile.kind === "team") ? root.currentTile : null
-              }
-              Text {
-                width: parent.width
-                horizontalAlignment: Text.AlignHCenter
-                wrapMode: Text.WordWrap
-                text: (root.currentTile && root.currentTile.kind === "team")
-                      ? (root.loading ? "Checking the schedule…" : "No " + root.currentTile.league_label + " game in the next " + root.currentTile.days + " days. Raise this team's look-ahead in Settings to see further.")
-                      : ""
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.bodySmall
-              }
             }
             ScoreSection {
               title: (root.currentTile && root.currentTile.kind === "league") ? root.currentTile.league_label + " SCOREBOARD" : ""
@@ -817,7 +679,8 @@ Panel {
             Text {
               width: parent.width
               horizontalAlignment: Text.AlignHCenter
-              text: (root.updatedText !== "" ? "Updated " + root.updatedText + " · " : "") + "build " + root.buildTag
+              visible: root.updatedText !== ""
+              text: "Updated " + root.updatedText
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.caption
@@ -1005,46 +868,16 @@ Panel {
                 width: parent.width
                 placeholderText: "Racing drivers (e.g. Larson, Verstappen)"
                 foreground: root.fg
-                Component.onCompleted: text = root.racingDriversText()
-                Connections {
-                  target: root
-                  function onConfigRevChanged() { racingField.text = root.racingDriversText() }
-                  function onOpenedChanged() { if (root.opened) racingField.text = root.racingDriversText() }
-                }
-                onTextEdited: root.applyRacing(text)
+                text: root.racingDriversText()
                 onEditingFinished: root.applyRacing(text)
-              }
-              Text {
-                width: parent.width
-                visible: root.racingNamesMissingLeague
-                text: "Saved, but no racing series is selected. Add NASCAR, IndyCar or Formula 1 under Leagues to see them."
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
               }
               TextField {
                 id: golfField
                 width: parent.width
                 placeholderText: "Golf players (e.g. Scheffler)"
                 foreground: root.fg
-                Component.onCompleted: text = (root.config.golf || []).join(", ")
-                Connections {
-                  target: root
-                  function onConfigRevChanged() { golfField.text = (root.config.golf || []).join(", ") }
-                  function onOpenedChanged() { if (root.opened) golfField.text = (root.config.golf || []).join(", ") }
-                }
-                onTextEdited: root.applyGolf(text)
+                text: (root.config.golf || []).join(", ")
                 onEditingFinished: root.applyGolf(text)
-              }
-              Text {
-                width: parent.width
-                visible: root.golfNamesMissingLeague
-                text: "Saved, but PGA Tour is not selected under Leagues."
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-                wrapMode: Text.WordWrap
               }
             }
 
@@ -1064,12 +897,8 @@ Panel {
               }
               Repeater {
                 model: root.config.teams || []
-                delegate: Column {
-                  id: teamColorRow
+                delegate: RowLayout {
                   required property string modelData
-                  width: parent.width
-                  spacing: Style.space(4)
-                  RowLayout {
                   width: parent.width
                   spacing: Style.space(8)
 
@@ -1090,17 +919,11 @@ Panel {
                     elide: Text.ElideRight
                   }
                   TextField {
-                    id: teamHex
                     Layout.preferredWidth: Style.space(110)
                     placeholderText: "#RRGGBB"
                     foreground: root.fg
-                    text: (root.config.team_colors || {})[teamColorRow.modelData] || ""
-                    onEditingFinished: root.setColorMap("team_colors", teamColorRow.modelData, text)
-                  }
-                  }
-                  Swatches {
-                    width: parent.width
-                    onPicked: function(hex) { teamHex.text = hex; root.setColorMap("team_colors", teamColorRow.modelData, hex) }
+                    text: (root.config.team_colors || {})[modelData] || ""
+                    onEditingFinished: root.setColorMap("team_colors", modelData, text)
                   }
                 }
               }
@@ -1121,12 +944,8 @@ Panel {
               }
               Repeater {
                 model: root.stateColorRows
-                delegate: Column {
-                  id: stateColorRow
+                delegate: RowLayout {
                   required property var modelData
-                  width: parent.width
-                  spacing: Style.space(4)
-                  RowLayout {
                   width: parent.width
                   spacing: Style.space(8)
 
@@ -1147,17 +966,11 @@ Panel {
                     elide: Text.ElideRight
                   }
                   TextField {
-                    id: stateHex
                     Layout.preferredWidth: Style.space(110)
-                    placeholderText: root.defaultStateColors[stateColorRow.modelData.key]
+                    placeholderText: root.defaultStateColors[modelData.key]
                     foreground: root.fg
-                    text: (root.config.state_colors || {})[stateColorRow.modelData.key] || ""
-                    onEditingFinished: root.setColorMap("state_colors", stateColorRow.modelData.key, text)
-                  }
-                  }
-                  Swatches {
-                    width: parent.width
-                    onPicked: function(hex) { stateHex.text = hex; root.setColorMap("state_colors", stateColorRow.modelData.key, hex) }
+                    text: (root.config.state_colors || {})[modelData.key] || ""
+                    onEditingFinished: root.setColorMap("state_colors", modelData.key, text)
                   }
                 }
               }
@@ -1179,11 +992,11 @@ Panel {
                   onClicked: root.setConfig("bar_logos", !root.showBarLogos)
                 }
                 Button {
-                  text: "League last in cycle: " + (root.cycleLeagues ? "On" : "Off")
+                  text: "League at end: " + (root.cycleLeagues ? "On" : "Off")
                   selected: root.cycleLeagues
                   foreground: root.fg
                   fontFamily: root.fontFamily
-                  onClicked: root.setConfig("league_in_cycle", !root.cycleLeagues)
+                  onClicked: root.setConfig("cycle_leagues", !root.cycleLeagues)
                 }
                 Item { Layout.fillWidth: true }
               }
@@ -1200,14 +1013,7 @@ Panel {
                 fontFamily: root.fontFamily
                 onClicked: root.refresh()
               }
-              Text {
-                Layout.fillWidth: true
-                elide: Text.ElideMiddle
-                text: (root.lastSaved !== "" ? "Saved " + root.lastSaved + " → " : "") + root.configPath
-                color: root.dim
-                font.family: root.fontFamily
-                font.pixelSize: Style.font.caption
-              }
+              Item { Layout.fillWidth: true }
               Button {
                 text: root.dirty ? "Save now" : "Saved"
                 active: root.dirty
@@ -1228,30 +1034,6 @@ Panel {
   // -------------------------------------------------------------------------
   // Large "current game" card
   // -------------------------------------------------------------------------
-  component Swatches: Flow {
-    id: sw
-    signal picked(string hex)
-    spacing: Style.space(5)
-    Repeater {
-      model: root.swatchPalette
-      delegate: Rectangle {
-        id: chip
-        required property string modelData
-        width: Style.space(16)
-        height: Style.space(16)
-        radius: 4
-        color: chip.modelData
-        border.width: 1
-        border.color: root.dim
-        MouseArea {
-          anchors.fill: parent
-          cursorShape: Qt.PointingHandCursor
-          onClicked: sw.picked(chip.modelData)
-        }
-      }
-    }
-  }
-
   component TeamBlock: Column {
     id: tb
     property var side: null
@@ -1281,17 +1063,6 @@ Panel {
       font.pixelSize: Style.font.display
       font.bold: true
     }
-    Item {
-      width: parent.width
-      height: Style.space(3)
-      Rectangle {
-        anchors.centerIn: parent
-        width: Style.space(40)
-        height: parent.height
-        radius: height / 2
-        color: root.teamColor(tb.side, "transparent")
-      }
-    }
     Text {
       width: parent.width
       horizontalAlignment: Text.AlignHCenter
@@ -1313,7 +1084,7 @@ Panel {
     implicitHeight: bigCol.implicitHeight + Style.space(28)
     height: implicitHeight
     radius: Style.cornerRadius * 2
-    color: Qt.rgba(big.catColor.r, big.catColor.g, big.catColor.b, 0.10)
+    color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.06)
     border.width: 2
     border.color: big.catColor
 
@@ -1383,7 +1154,7 @@ Panel {
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
             text: !big.game ? "" : (big.game.state === "pre" ? "@" : big.game.away.score + " – " + big.game.home.score)
-            color: big.catColor
+            color: root.fg
             font.family: root.fontFamily
             font.pixelSize: Math.round(Style.font.display * 1.6)
             font.bold: true
@@ -1567,7 +1338,7 @@ Panel {
     watchChanges: false
     printErrors: false
     onLoaded: root.applyConfigText(text())
-    onLoadFailed: root.saveConfig()
+    onLoadFailed: { root.config = root.defaultConfig(); root.saveConfig() }
   }
 
   Process {
@@ -1586,21 +1357,16 @@ Panel {
         try {
           var parsed = JSON.parse(text)
           if (parsed && typeof parsed === "object") {
-            root.scores = parsed
             if (parsed.error) root.statusText = "Fetch error: " + parsed.error
+            else {
+              root.scores = parsed
+              if (parsed.fetch_errors > 0) root.statusText = "Some data may be out of date"
+            }
           }
         } catch (e) {
           root.statusText = "Could not read scores"
         }
         root.loading = false
-      }
-    }
-    stderr: StdioCollector {
-      waitForEnd: true
-      onStreamFinished: {
-        var lines = String(text).trim().split("\n")
-        var last = lines[lines.length - 1]
-        if (last) root.statusText = "Fetch failed: " + last
       }
     }
     onRunningChanged: {
@@ -1615,8 +1381,7 @@ Panel {
     id: saveProc
     running: false
     onExited: function(exitCode) {
-      if (exitCode !== 0) { root.dirty = true; root.statusText = "Could not save settings (exit " + exitCode + ")" }
-      else root.lastSaved = Qt.formatTime(new Date(), "h:mm:ss AP") + " · " + (root.config.teams || []).length + " teams"
+      if (exitCode !== 0) { root.dirty = true; root.statusText = "Could not save settings" }
     }
     onRunningChanged: {
       if (running) return
@@ -1649,32 +1414,12 @@ Panel {
   Timer {
     id: rotateTimer
     interval: Math.max(2, root.config.rotate_seconds || 6) * 1000
-    // Keep both the bar and opened scoreboard view rotating together.
-    running: root.bar !== null && root.tiles.length > 1
+    // Don't auto-advance while the big card is open; the user is driving.
+    running: root.bar !== null && root.tiles.length > 1 && !(root.opened && root.mode === "current")
     repeat: true
     onTriggered: root.rotateIndex = (root.safeIndex + 1) % Math.max(1, root.tiles.length)
   }
 
-  onOpenedChanged: {
-    if (opened) root.refresh()
-    else {
-      root.lastClosedAt = Date.now()
-      root.lastClosedMode = root.mode
-      if (dirty) root.saveConfig()
-    }
-  }
+  onOpenedChanged: { if (opened) root.refresh(); else if (dirty) root.saveConfig() }
   Component.onCompleted: root.refresh()
-
-  // First run after install: ask where the widget should live in the bar.
-  Timer {
-    id: firstRunTimer
-    interval: 1500
-    running: true
-    onTriggered: {
-      if (!root.config.positioned) {
-        root.mode = "settings"
-        root.open()
-      }
-    }
-  }
 }

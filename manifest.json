@@ -2,16 +2,15 @@
   "schemaVersion": 1,
   "id": "io.github.auggnation.auggment-scoreboard",
   "name": "Auggment Scoreboard",
-  "version": "1.0.0",
-  "author": "Auggment",
+  "version": "1.1.0",
+  "author": "auggnation",
   "license": "MIT",
-  "description": "Lightweight live sports scores in the bar, from ESPN. Pick leagues, favourite teams, drivers and golfers; a compact rotating score with live and final games. Click for a larger board with game clock, period/quarter/inning and start times; right-click for settings.",
+  "description": "Live scores for your favorite teams in the Omarchy bar, with a game view, league scoreboards and settings panel.",
   "kinds": ["bar-widget"],
-  "entryPoints": { "barWidget": "Panel.qml" },
+  "entryPoints": { "barWidget": "BarWidget.qml" },
   "barWidget": {
     "displayName": "Auggment Scoreboard",
-    "description": "Rotating live sports scores from ESPN",
-    "category": "News",
+    "category": "Sports",
     "allowMultiple": false,
     "defaultSection": "right"
   }

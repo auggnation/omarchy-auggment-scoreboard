@@ -40,7 +40,7 @@ for _path, _teams in TSDB_TEAMS.items():
 
 
 def source_for(path):
-    """Return the data source ("esports" / "tsdb" / "espn") for a league path."""
+    """Return the data source ("tsdb" / "espn") for a league path."""
     return "tsdb" if path in TSDB_LEAGUE_IDS else "espn"
 
 
