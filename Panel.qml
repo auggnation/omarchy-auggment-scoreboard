@@ -270,8 +270,9 @@ Panel {
         return d !== 0 ? d : String(a.start).localeCompare(String(b.start))
       })
       var live = list.filter(function(g) { return g.state === "in" }).length
-      out.push({ kind: "league", league_path: lp, league_label: list[0].league_label || Model.labelFor(lp),
-                 games: list, live: live, state: live > 0 ? "in" : "pre" })
+      // Make each game its own tile so the bar and opened view
+      // rotate through individual games instead of whole leagues.
+      for (var j = 0; j < list.length; j++) out.push(list[j])
     }
     return out
   }
@@ -1439,8 +1440,8 @@ Panel {
   Timer {
     id: rotateTimer
     interval: Math.max(2, root.config.rotate_seconds || 6) * 1000
-    // Don't auto-advance while the big card is open; the user is driving.
-    running: root.bar !== null && root.tiles.length > 1 && !(root.opened && root.mode === "current")
+    // Keep both the bar and opened scoreboard view rotating together.
+    running: root.bar !== null && root.tiles.length > 1
     repeat: true
     onTriggered: root.rotateIndex = (root.safeIndex + 1) % Math.max(1, root.tiles.length)
   }
