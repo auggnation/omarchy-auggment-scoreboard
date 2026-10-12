@@ -33,7 +33,7 @@ DEFAULTS = {
     "days_ahead": 7,
     "state_colors": {},
     "bar_logos": True,
-    "cycle_leagues": True,
+    "league_in_cycle": False,
     "refresh_seconds": 60,
     "rotate_seconds": 6,
     "max_games": 40,

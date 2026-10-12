@@ -9,36 +9,15 @@ import "Model.js" as Model
 
 // Auggment Scoreboard — a lightweight live-scores bar widget.
 //
-// Loaded by BarWidget.qml (the manifest entry point). BarWidget draws the bar
-// item and forwards clicks here (left = game view, right = settings, middle =
-// refresh); this file owns the data, rotation and the popup. Scores come from
-// ESPN / TheSportsDB via bin/fetch-scores.py; the config lives at
+// Left click opens the scores view (rotating through your favorites), right
+// click opens settings, middle click refreshes now. Scores come from ESPN via
+// the bundled bin/fetch-scores.py; the config lives at
 // ~/.config/auggment/scoreboard.json.
 Panel {
   id: root
   moduleName: "io.github.auggnation.auggment-scoreboard"
   ipcTarget: "io.github.auggnation.auggment-scoreboard"
   manageIpc: false
-
-  // Injected by BarWidget.qml.
-  property var anchorItem: null
-  property var hostWidget: null
-
-  function open() { root.controller.show() }
-  function close() { root.controller.hide() }
-
-  function switchPanel(direction) {
-    if (root.bar && typeof root.bar.switchPanelFrom === "function")
-      return root.bar.switchPanelFrom(root.hostWidget || root, direction)
-    return false
-  }
-
-  // Clicking the view that is already open closes the popup; otherwise switch.
-  function showMode(m) {
-    if (opened && mode === m) { close(); return }
-    mode = m
-    if (!opened) open()
-  }
 
   readonly property string home: Quickshell.env("HOME")
   readonly property string configPath: home + "/.config/auggment/scoreboard.json"
@@ -49,13 +28,13 @@ Panel {
 
   property var config: root.defaultConfig()
   property var scores: ({})
-  property string mode: "scores"
+  property string mode: "current"
   property int rotateIndex: 0
   property bool loading: false
   property bool dirty: false
   property bool savePending: false
+  property int configRev: 0   // bumps when the config file is (re)loaded; text fields re-sync on it
   property bool refreshQueued: false
-  property bool configLoadedOnce: false
   property string statusText: ""
 
   // Colours for the four game states; overridable via config.state_colors.
@@ -72,12 +51,17 @@ Panel {
     var u = scores && scores.updated ? Date.parse(scores.updated) : NaN
     return isNaN(u) ? "" : Qt.formatTime(new Date(u), "h:mm AP")
   }
+  readonly property var swatchPalette: ["#E31837", "#F97316", "#F59E0B", "#22C55E", "#14B8A6", "#3B82F6",
+                                         "#6366F1", "#A855F7", "#EC4899", "#FFFFFF", "#9CA3AF", "#111827"]
   readonly property bool showBarLogos: config.bar_logos !== false
-  readonly property bool cycleLeagues: config.cycle_leagues !== false
+  readonly property bool cycleLeagues: config.league_in_cycle === true
 
   readonly property color fg: bar ? bar.foreground : Color.foreground
   readonly property color dim: Qt.darker(fg, 1.5)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
+
+  implicitWidth: button.implicitWidth
+  implicitHeight: button.implicitHeight
 
   function defaultConfig() {
     return {
@@ -95,7 +79,7 @@ Panel {
       max_games: 40,
       state_colors: {},
       bar_logos: true,
-      cycle_leagues: true,
+      league_in_cycle: false,
       position: "right",
       positioned: false
     }
@@ -140,7 +124,7 @@ Panel {
     var base = defaultConfig()
     for (var k in parsed) base[k] = parsed[k]
     config = base
-    if (!configLoadedOnce) { configLoadedOnce = true; refresh() }
+    configRev++
   }
 
   // Settings are written to ~/.config/auggment/scoreboard.json automatically
@@ -186,11 +170,9 @@ Panel {
 
   function teamAhead(key) {
     var overrides = config.days_ahead_teams || {}
-    var want = normKey(key)
-    var v
-    for (var k in overrides) if (normKey(k) === want) { v = overrides[k]; break }
+    var v = overrides[key]
     if (v === undefined || v === null || v === "") return (config.days_ahead || 7)
-    return Number(v)
+    return v
   }
 
   function setTeamAhead(key, value) {
@@ -201,18 +183,11 @@ Panel {
     setConfig("days_ahead_teams", overrides)
   }
 
-  // Whole calendar days from today (local time) to the game's date: 0 = today,
-  // 1 = tomorrow. Counting calendar days (not 24h blocks) means a game on the
-  // last day of the window is no longer dropped because of its kick-off time.
   function daysUntil(iso) {
     if (!iso) return 0
     var t = Date.parse(iso)
     if (isNaN(t)) return 0
-    var g = new Date(t)
-    var n = new Date()
-    var gd = new Date(g.getFullYear(), g.getMonth(), g.getDate())
-    var nd = new Date(n.getFullYear(), n.getMonth(), n.getDate())
-    return Math.round((gd.getTime() - nd.getTime()) / 86400000)
+    return Math.ceil((t - Date.now()) / 86400000)
   }
 
   function gameVisible(g) {
@@ -378,6 +353,14 @@ Panel {
     return fallback
   }
 
+  // Left click -> current game, right click -> settings. Clicking the same
+  // view again closes the dropdown; clicking the other one just switches.
+  function showMode(m) {
+    if (opened && mode === m) { close(); return }
+    mode = m
+    if (!opened) open()
+  }
+
   function rotateNext() {
     if (tiles.length > 1) { rotateIndex = (safeIndex + 1) % tiles.length; rotateTimer.restart() }
   }
@@ -404,7 +387,7 @@ Panel {
 
   function barLabel() {
     var t = currentTile
-    if (!t) return loading ? "…" : ((config.teams || []).length === 0 ? "Pick teams" : "No games")
+    if (!t) return loading ? "…" : ((config.teams || []).length === 0 ? "Pick teams" : "—")
     if (t.kind === "league") {
       return t.league_label + " · " + (t.live > 0 ? t.live + " live" : t.games.length + " games")
     }
@@ -464,13 +447,125 @@ Panel {
   function applyRacing(text) {
     var names = String(text || "").split(",").map(function(s) { return s.trim() }).filter(function(s) { return s.length > 0 })
     var dict = {}
-    var leagues = racingLeagues()
-    for (var i = 0; i < leagues.length; i++) dict[leagues[i]] = names
+    // Store the names under every racing series, not just the selected ones,
+    // so they are kept even if a series is selected later.
+    for (var i = 0; i < Model.LEAGUES.length; i++) {
+      if (Model.isRacing(Model.LEAGUES[i].path)) dict[Model.LEAGUES[i].path] = names
+    }
     setConfig("racing", dict)
   }
+  readonly property bool racingNamesMissingLeague: racingDriversText() !== "" && racingLeagues().length === 0
+  readonly property bool golfNamesMissingLeague: (config.golf || []).length > 0 && (config.leagues || []).indexOf("golf/pga") < 0
   function applyGolf(text) {
     var names = String(text || "").split(",").map(function(s) { return s.trim() }).filter(function(s) { return s.length > 0 })
     setConfig("golf", names)
+  }
+
+  // -------------------------------------------------------------------------
+  // Bar button
+  // -------------------------------------------------------------------------
+  // WidgetButton is required (not a bare MouseArea): the bar routes slot
+  // presses through its registered click targets and calls triggerPress() on
+  // them, so an unregistered Item never receives clicks. Its label is hidden
+  // and the logo/abbr row is drawn as non-interactive children on top.
+  WidgetButton {
+    id: button
+    anchors.fill: parent
+    bar: root.bar
+    text: ""
+    labelVisible: false
+    hasVisualContent: true
+    foreground: root.currentColor
+    fontFamily: root.fontFamily
+    fixedWidth: barRow.implicitWidth + Style.space(12)
+    fixedHeight: Math.max(barRow.implicitHeight, Style.space(16)) + Style.space(8)
+    tooltipText: "Auggment Scoreboard"
+    onPressed: function(btn) {
+      if (btn === Qt.RightButton) root.showMode("settings")
+      else if (btn === Qt.MiddleButton) root.refresh()
+      else root.showMode("current")
+    }
+    // Scroll over the bar item to step through games without opening it.
+    onWheelMoved: function(delta) {
+      if (delta > 0) root.rotatePrev()
+      else if (delta < 0) root.rotateNext()
+    }
+
+    HoverHandler { id: barHover }
+
+    Rectangle {
+      anchors.fill: parent
+      radius: Style.cornerRadius
+      color: barHover.hovered ? Style.hoverFillFor(root.fg, Color.accent)
+             : (root.currentTile ? Qt.rgba(root.currentColor.r, root.currentColor.g, root.currentColor.b, 0.18) : "transparent")
+      border.width: root.currentTile ? 1 : 0
+      border.color: Qt.rgba(root.currentColor.r, root.currentColor.g, root.currentColor.b, 0.6)
+    }
+
+    Row {
+      id: barRow
+      anchors.centerIn: parent
+      spacing: Style.space(5)
+
+      // ---- game tile: [logo] AWAY 24–17 HOME [logo] ----
+      Image {
+        visible: root.showBarLogos && !!root.barGame && !!root.barGame.away.logo
+        width: Style.space(16); height: Style.space(16)
+        anchors.verticalCenter: parent.verticalCenter
+        fillMode: Image.PreserveAspectFit
+        asynchronous: true
+        smooth: true
+        sourceSize.width: 48; sourceSize.height: 48
+        source: visible ? root.barGame.away.logo : ""
+      }
+      Text {
+        visible: !!root.barGame
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.barGame ? root.barGame.away.abbr : ""
+        color: root.teamColor(root.barGame ? root.barGame.away : null, root.fg)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: true
+      }
+      Text {
+        visible: !!root.barGame
+        anchors.verticalCenter: parent.verticalCenter
+        text: !root.barGame ? "" : (root.barGame.state === "pre" ? "@" : root.barGame.away.score + "–" + root.barGame.home.score)
+        color: root.currentColor
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: true
+      }
+      Text {
+        visible: !!root.barGame
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.barGame ? root.barGame.home.abbr : ""
+        color: root.teamColor(root.barGame ? root.barGame.home : null, root.fg)
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+        font.bold: true
+      }
+      Image {
+        visible: root.showBarLogos && !!root.barGame && !!root.barGame.home.logo
+        width: Style.space(16); height: Style.space(16)
+        anchors.verticalCenter: parent.verticalCenter
+        fillMode: Image.PreserveAspectFit
+        asynchronous: true
+        smooth: true
+        sourceSize.width: 48; sourceSize.height: 48
+        source: visible ? root.barGame.home.logo : ""
+      }
+
+      // ---- league / race / golf tile, or nothing to show ----
+      Text {
+        visible: !root.barGame
+        anchors.verticalCenter: parent.verticalCenter
+        text: root.barLabel()
+        color: root.currentColor
+        font.family: root.fontFamily
+        font.pixelSize: Style.font.caption
+      }
+    }
   }
 
   IpcHandler {
@@ -493,8 +588,8 @@ Panel {
   // -------------------------------------------------------------------------
   KeyboardPanel {
     id: panel
-    anchorItem: root.anchorItem
-    owner: root.hostWidget || root
+    anchorItem: button
+    owner: root
     bar: root.bar
     open: root.opened
     focusTarget: keyCatcher
@@ -550,14 +645,14 @@ Panel {
             spacing: Style.space(6)
 
             Button {
-              text: "Current game"
+              text: "Game"
               selected: root.mode === "current"
               foreground: root.fg
               fontFamily: root.fontFamily
               onClicked: root.mode = "current"
             }
             Button {
-              text: "League scores"
+              text: "Scores"
               selected: root.mode === "scores"
               foreground: root.fg
               fontFamily: root.fontFamily
@@ -578,7 +673,7 @@ Panel {
             }
             Item { Layout.fillWidth: true }
             Button {
-              text: root.loading ? "…" : "Refresh"
+              text: root.loading ? "…" : "⟳"
               foreground: root.fg
               fontFamily: root.fontFamily
               onClicked: root.refresh()
@@ -620,7 +715,7 @@ Panel {
             Text {
               width: parent.width
               visible: !root.currentTile
-              text: root.loading ? "Loading…" : (root.hasFavorites ? "None of your teams have a game in their look-ahead window. Raise a team's look-ahead in Settings to look further out." : "No favorite teams yet. Open Settings to pick leagues and favorites.")
+              text: root.loading ? "Loading…" : "No favorite teams yet. Open Settings to pick leagues and favorites."
               color: root.dim
               font.family: root.fontFamily
               font.pixelSize: Style.font.body
@@ -868,16 +963,46 @@ Panel {
                 width: parent.width
                 placeholderText: "Racing drivers (e.g. Larson, Verstappen)"
                 foreground: root.fg
-                text: root.racingDriversText()
+                Component.onCompleted: text = root.racingDriversText()
+                Connections {
+                  target: root
+                  function onConfigRevChanged() { racingField.text = root.racingDriversText() }
+                  function onOpenedChanged() { if (root.opened) racingField.text = root.racingDriversText() }
+                }
+                onTextEdited: root.applyRacing(text)
                 onEditingFinished: root.applyRacing(text)
+              }
+              Text {
+                width: parent.width
+                visible: root.racingNamesMissingLeague
+                text: "Saved, but no racing series is selected. Add NASCAR, IndyCar or Formula 1 under Leagues to see them."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
               }
               TextField {
                 id: golfField
                 width: parent.width
                 placeholderText: "Golf players (e.g. Scheffler)"
                 foreground: root.fg
-                text: (root.config.golf || []).join(", ")
+                Component.onCompleted: text = (root.config.golf || []).join(", ")
+                Connections {
+                  target: root
+                  function onConfigRevChanged() { golfField.text = (root.config.golf || []).join(", ") }
+                  function onOpenedChanged() { if (root.opened) golfField.text = (root.config.golf || []).join(", ") }
+                }
+                onTextEdited: root.applyGolf(text)
                 onEditingFinished: root.applyGolf(text)
+              }
+              Text {
+                width: parent.width
+                visible: root.golfNamesMissingLeague
+                text: "Saved, but PGA Tour is not selected under Leagues."
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
+                wrapMode: Text.WordWrap
               }
             }
 
@@ -897,8 +1022,12 @@ Panel {
               }
               Repeater {
                 model: root.config.teams || []
-                delegate: RowLayout {
+                delegate: Column {
+                  id: teamColorRow
                   required property string modelData
+                  width: parent.width
+                  spacing: Style.space(4)
+                  RowLayout {
                   width: parent.width
                   spacing: Style.space(8)
 
@@ -919,11 +1048,17 @@ Panel {
                     elide: Text.ElideRight
                   }
                   TextField {
+                    id: teamHex
                     Layout.preferredWidth: Style.space(110)
                     placeholderText: "#RRGGBB"
                     foreground: root.fg
-                    text: (root.config.team_colors || {})[modelData] || ""
-                    onEditingFinished: root.setColorMap("team_colors", modelData, text)
+                    text: (root.config.team_colors || {})[teamColorRow.modelData] || ""
+                    onEditingFinished: root.setColorMap("team_colors", teamColorRow.modelData, text)
+                  }
+                  }
+                  Swatches {
+                    width: parent.width
+                    onPicked: function(hex) { teamHex.text = hex; root.setColorMap("team_colors", teamColorRow.modelData, hex) }
                   }
                 }
               }
@@ -944,8 +1079,12 @@ Panel {
               }
               Repeater {
                 model: root.stateColorRows
-                delegate: RowLayout {
+                delegate: Column {
+                  id: stateColorRow
                   required property var modelData
+                  width: parent.width
+                  spacing: Style.space(4)
+                  RowLayout {
                   width: parent.width
                   spacing: Style.space(8)
 
@@ -966,11 +1105,17 @@ Panel {
                     elide: Text.ElideRight
                   }
                   TextField {
+                    id: stateHex
                     Layout.preferredWidth: Style.space(110)
-                    placeholderText: root.defaultStateColors[modelData.key]
+                    placeholderText: root.defaultStateColors[stateColorRow.modelData.key]
                     foreground: root.fg
-                    text: (root.config.state_colors || {})[modelData.key] || ""
-                    onEditingFinished: root.setColorMap("state_colors", modelData.key, text)
+                    text: (root.config.state_colors || {})[stateColorRow.modelData.key] || ""
+                    onEditingFinished: root.setColorMap("state_colors", stateColorRow.modelData.key, text)
+                  }
+                  }
+                  Swatches {
+                    width: parent.width
+                    onPicked: function(hex) { stateHex.text = hex; root.setColorMap("state_colors", stateColorRow.modelData.key, hex) }
                   }
                 }
               }
@@ -992,11 +1137,11 @@ Panel {
                   onClicked: root.setConfig("bar_logos", !root.showBarLogos)
                 }
                 Button {
-                  text: "League at end: " + (root.cycleLeagues ? "On" : "Off")
+                  text: "League last in cycle: " + (root.cycleLeagues ? "On" : "Off")
                   selected: root.cycleLeagues
                   foreground: root.fg
                   fontFamily: root.fontFamily
-                  onClicked: root.setConfig("cycle_leagues", !root.cycleLeagues)
+                  onClicked: root.setConfig("league_in_cycle", !root.cycleLeagues)
                 }
                 Item { Layout.fillWidth: true }
               }
@@ -1034,6 +1179,30 @@ Panel {
   // -------------------------------------------------------------------------
   // Large "current game" card
   // -------------------------------------------------------------------------
+  component Swatches: Flow {
+    id: sw
+    signal picked(string hex)
+    spacing: Style.space(5)
+    Repeater {
+      model: root.swatchPalette
+      delegate: Rectangle {
+        id: chip
+        required property string modelData
+        width: Style.space(16)
+        height: Style.space(16)
+        radius: 4
+        color: chip.modelData
+        border.width: 1
+        border.color: root.dim
+        MouseArea {
+          anchors.fill: parent
+          cursorShape: Qt.PointingHandCursor
+          onClicked: sw.picked(chip.modelData)
+        }
+      }
+    }
+  }
+
   component TeamBlock: Column {
     id: tb
     property var side: null
@@ -1063,6 +1232,17 @@ Panel {
       font.pixelSize: Style.font.display
       font.bold: true
     }
+    Item {
+      width: parent.width
+      height: Style.space(3)
+      Rectangle {
+        anchors.centerIn: parent
+        width: Style.space(40)
+        height: parent.height
+        radius: height / 2
+        color: root.teamColor(tb.side, "transparent")
+      }
+    }
     Text {
       width: parent.width
       horizontalAlignment: Text.AlignHCenter
@@ -1084,7 +1264,7 @@ Panel {
     implicitHeight: bigCol.implicitHeight + Style.space(28)
     height: implicitHeight
     radius: Style.cornerRadius * 2
-    color: Qt.rgba(root.fg.r, root.fg.g, root.fg.b, 0.06)
+    color: Qt.rgba(big.catColor.r, big.catColor.g, big.catColor.b, 0.10)
     border.width: 2
     border.color: big.catColor
 
@@ -1154,7 +1334,7 @@ Panel {
             width: parent.width
             horizontalAlignment: Text.AlignHCenter
             text: !big.game ? "" : (big.game.state === "pre" ? "@" : big.game.away.score + " – " + big.game.home.score)
-            color: root.fg
+            color: big.catColor
             font.family: root.fontFamily
             font.pixelSize: Math.round(Style.font.display * 1.6)
             font.bold: true
@@ -1356,13 +1536,7 @@ Panel {
       onStreamFinished: {
         try {
           var parsed = JSON.parse(text)
-          if (parsed && typeof parsed === "object") {
-            if (parsed.error) root.statusText = "Fetch error: " + parsed.error
-            else {
-              root.scores = parsed
-              if (parsed.fetch_errors > 0) root.statusText = "Some data may be out of date"
-            }
-          }
+          if (parsed && typeof parsed === "object") root.scores = parsed
         } catch (e) {
           root.statusText = "Could not read scores"
         }
@@ -1414,12 +1588,27 @@ Panel {
   Timer {
     id: rotateTimer
     interval: Math.max(2, root.config.rotate_seconds || 6) * 1000
-    // Don't auto-advance while the big card is open; the user is driving.
-    running: root.bar !== null && root.tiles.length > 1 && !(root.opened && root.mode === "current")
+    // Keep both the bar and opened scoreboard view rotating together.
+    running: root.bar !== null && root.tiles.length > 1
     repeat: true
     onTriggered: root.rotateIndex = (root.safeIndex + 1) % Math.max(1, root.tiles.length)
   }
 
   onOpenedChanged: { if (opened) root.refresh(); else if (dirty) root.saveConfig() }
   Component.onCompleted: root.refresh()
+
+  // First run after install: offer the bar placement once. Mark it handled
+  // immediately so dismissing the panel doesn't re-open it on every restart.
+  Timer {
+    id: firstRunTimer
+    interval: 1500
+    running: true
+    onTriggered: {
+      if (!root.config.positioned) {
+        root.setConfig("positioned", true)
+        root.mode = "settings"
+        root.open()
+      }
+    }
+  }
 }

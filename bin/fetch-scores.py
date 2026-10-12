@@ -27,8 +27,6 @@ import argparse
 import json
 import os
 import sys
-import tempfile
-import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from urllib import request, error
@@ -130,77 +128,10 @@ USER_AGENT = "AuggmentScoreboard/1.0 (+https://github.com/auggnation/omarchy-aug
 TSDB_BASE = "https://www.thesportsdb.com/api/v1/json/3"
 
 
-CACHE_PATH = os.path.expanduser("~/.cache/auggment/scoreboard-cache.json")
-CACHE_MAX_AGE = 3600          # seconds a cached day may stand in for a failed request
-_cache = {}
-_cache_dirty = False
-_fetch_errors = 0
-
-
-def http_json(url, timeout=8, attempts=3):
-    """GET json, retrying transient failures (ESPN occasionally drops a request)."""
-    last = None
-    for attempt in range(attempts):
-        try:
-            req = request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
-            with request.urlopen(req, timeout=timeout) as resp:
-                return json.loads(resp.read().decode("utf-8", "replace"))
-        except error.HTTPError as exc:
-            last = exc
-            if exc.code in (400, 401, 403, 404):
-                break
-        except Exception as exc:
-            last = exc
-        if attempt + 1 < attempts:
-            time.sleep(0.4 * (attempt + 1))
-    raise last
-
-
-def load_cache():
-    global _cache
-    try:
-        with open(CACHE_PATH, "r") as fh:
-            data = json.load(fh)
-        if isinstance(data, dict):
-            _cache = data
-    except Exception:
-        _cache = {}
-
-
-def save_cache():
-    """Write the cache atomically; drop entries too old to be useful."""
-    global _cache_dirty
-    if not _cache_dirty:
-        return
-    cutoff = time.time() - CACHE_MAX_AGE
-    keep = {k: v for k, v in _cache.items()
-            if isinstance(v, dict) and v.get("t", 0) >= cutoff}
-    try:
-        os.makedirs(os.path.dirname(CACHE_PATH), mode=0o700, exist_ok=True)
-        fd, tmp = tempfile.mkstemp(dir=os.path.dirname(CACHE_PATH), prefix=".cache.", suffix=".tmp")
-        with os.fdopen(fd, "w") as fh:
-            json.dump(keep, fh)
-        os.replace(tmp, CACHE_PATH)
-    except Exception:
-        pass
-
-
-def cached_events(url):
-    """Return the "events" list for url. If the request still fails after retries,
-    fall back to a recent cached copy so one dropped request does not make a
-    team's game disappear; only raise when there is nothing to fall back on."""
-    global _cache_dirty, _fetch_errors
-    try:
-        events = http_json(url).get("events") or []
-    except Exception:
-        _fetch_errors += 1
-        entry = _cache.get(url)
-        if isinstance(entry, dict) and time.time() - entry.get("t", 0) < CACHE_MAX_AGE:
-            return entry.get("events") or []
-        raise
-    _cache[url] = {"t": time.time(), "events": events}
-    _cache_dirty = True
-    return events
+def http_json(url, timeout=8):
+    req = request.Request(url, headers={"User-Agent": USER_AGENT, "Accept": "application/json"})
+    with request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8", "replace"))
 
 
 def load_config(path):
@@ -237,46 +168,43 @@ def tzinfo(name):
         return timezone.utc
 
 
-def fetch_league(path, days_back, days_ahead, tz=None):
+def fetch_league(path, days_back, days_ahead):
     sport, league = ESPN_API_PATHS.get(path, (path.split("/")[0], path.split("/")[-1]))
     host = "site.web.api.espn.com" if path in ESPN_WEB_API_LEAGUES else "site.api.espn.com"
     base = f"https://{host}/apis/site/v2/sports/{sport}/{league}/scoreboard"
 
-    if path in ESPN_NO_DATE_LEAGUES:
-        urls = [base]
-    else:
-        # Use the user's local date, not UTC, so "today" is correct in the evening.
-        today = datetime.now(tz or timezone.utc).date()
-        day = today - timedelta(days=days_back)
-        end = today + timedelta(days=max(days_ahead, 1))
-        urls = []
-        while day <= end:
-            urls.append(f"{base}?dates={day.strftime('%Y%m%d')}")
-            day += timedelta(days=1)
-
-    def one(url):
-        try:
-            return cached_events(url)
-        except Exception:
-            return []
-
-    # One request per day, all at once (they used to run one after another, so
-    # a slow day could push a refresh past its interval).
-    with ThreadPoolExecutor(max_workers=min(6, len(urls))) as pool:
-        results = list(pool.map(one, urls))
-
     events = []
     seen = set()
-    for day_events in results:
-        for e in day_events:
-            if e.get("id") and e["id"] not in seen:
-                seen.add(e["id"])
-                events.append(e)
+
+    if path in ESPN_NO_DATE_LEAGUES:
+        try:
+            for e in http_json(base).get("events", []):
+                if e.get("id") and e["id"] not in seen:
+                    seen.add(e["id"])
+                    events.append(e)
+        except Exception:
+            pass
+        return events
+
+    now = datetime.now(timezone.utc)
+    day = (now - timedelta(days=days_back)).date()
+    end = (now + timedelta(days=max(days_ahead, 1))).date()
+    while day <= end:
+        try:
+            url = f"{base}?dates={day.strftime('%Y%m%d')}"
+            for e in http_json(url).get("events", []):
+                if e.get("id") and e["id"] not in seen:
+                    seen.add(e["id"])
+                    events.append(e)
+        except Exception:
+            pass
+        day += timedelta(days=1)
+
     events.sort(key=lambda e: e.get("date", ""))
     return events
 
 
-def fetch_tsdb(path, days_back, days_ahead, tz=None):
+def fetch_tsdb(path, days_back, days_ahead):
     """Fetch a league from TheSportsDB (used for leagues ESPN does not carry).
 
     Combines the next and previous fixtures for the league and keeps only the
@@ -288,25 +216,22 @@ def fetch_tsdb(path, days_back, days_ahead, tz=None):
     events = {}
     for endpoint in ("eventsnextleague.php", "eventspastleague.php"):
         try:
-            fetched = cached_events(f"{TSDB_BASE}/{endpoint}?id={lid}")
+            data = http_json(f"{TSDB_BASE}/{endpoint}?id={lid}")
         except Exception:
             continue
-        for e in fetched:
+        for e in data.get("events") or []:
             eid = e.get("idEvent")
             if eid and eid not in events:
                 events[eid] = e
 
-    today = datetime.now(tz or timezone.utc).date()
-    lo = today - timedelta(days=days_back)
-    hi = today + timedelta(days=max(days_ahead, 1))
+    now = datetime.now(timezone.utc)
+    lo = (now - timedelta(days=days_back)).date()
+    hi = (now + timedelta(days=max(days_ahead, 1))).date()
     out = []
     for e in events.values():
         ts = e.get("strTimestamp") or ""
         try:
-            dt0 = datetime.fromisoformat(ts.replace("Z", "+00:00"))
-            if dt0.tzinfo is None:
-                dt0 = dt0.replace(tzinfo=timezone.utc)
-            d = dt0.astimezone(tz or timezone.utc).date()
+            d = datetime.fromisoformat(ts.replace("Z", "+00:00")).date()
         except Exception:
             out.append(e)
             continue
@@ -316,11 +241,11 @@ def fetch_tsdb(path, days_back, days_ahead, tz=None):
     return out
 
 
-def _safe_fetch(path, days_back, days_ahead, tz=None):
+def _safe_fetch(path, days_back, days_ahead):
     try:
         if leagues.source_for(path) == "tsdb":
-            return fetch_tsdb(path, days_back, days_ahead, tz)
-        return fetch_league(path, days_back, days_ahead, tz)
+            return fetch_tsdb(path, days_back, days_ahead)
+        return fetch_league(path, days_back, days_ahead)
     except Exception:
         return []
 
@@ -637,10 +562,8 @@ def build(cfg):
 
     games, races, golf = [], [], []
     league_paths = [p for p in cfg.get("leagues", []) if isinstance(p, str)]
-    load_cache()
-    with ThreadPoolExecutor(max_workers=min(4, max(1, len(league_paths)))) as pool:
-        fetched = list(pool.map(lambda p: (p, _safe_fetch(p, days_back, window_for(p), tz)), league_paths))
-    save_cache()
+    with ThreadPoolExecutor(max_workers=min(8, max(1, len(league_paths)))) as pool:
+        fetched = list(pool.map(lambda p: (p, _safe_fetch(p, days_back, window_for(p))), league_paths))
     for path, events in fetched:
         for event in events:
             try:
@@ -670,7 +593,6 @@ def build(cfg):
         "updated": datetime.now(tz).isoformat(),
         "timezone": cfg.get("timezone"),
         "counts": {"games": len(games), "races": len(races), "golf": len(golf)},
-        "fetch_errors": _fetch_errors,
         "games": games[:max_games],
         "races": races,
         "golf": golf,
