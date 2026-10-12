@@ -250,13 +250,27 @@ def _safe_fetch(path, days_back, days_ahead):
         return []
 
 
+def safe_external_url(value):
+    """Return the URL only when it is an http(s) link.
+
+    Feed data is untrusted: a file: URL or a custom scheme would otherwise be
+    handed to the desktop's MIME/protocol handlers (e.g. via xdg-open), so drop
+    everything that is not http/https.
+    """
+    url = str(value or "").strip()
+    lowered = url.lower()
+    if lowered.startswith("http://") or lowered.startswith("https://"):
+        return url
+    return ""
+
+
 def team_logo(team):
     if not isinstance(team, dict):
         return ""
     logos = team.get("logos") or []
     if logos and isinstance(logos[0], dict):
-        return logos[0].get("href", "")
-    return team.get("logo", "")
+        return safe_external_url(logos[0].get("href", ""))
+    return safe_external_url(team.get("logo", ""))
 
 
 def team_color(team, override):
@@ -328,7 +342,7 @@ def parse_team_game(path, event, cfg_favs, cfg_colors, tz):
         "start_local": start_local,
         "start_full": start_full,
         "name": event.get("shortName") or event.get("name", ""),
-        "link": (event.get("links") or [{}])[0].get("href", ""),
+        "link": safe_external_url((event.get("links") or [{}])[0].get("href", "")),
         "away": a,
         "home": h,
         "is_fav": a["fav"] or h["fav"],

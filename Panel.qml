@@ -361,6 +361,18 @@ Panel {
     if (!opened) open()
   }
 
+  // Feed links are untrusted: only ever hand http/https URLs to xdg-open, so a
+  // feed-controlled file: URL or custom scheme cannot reach local handlers.
+  function safeLink(url) {
+    var s = String(url || "").trim().toLowerCase()
+    return s.indexOf("http://") === 0 || s.indexOf("https://") === 0
+  }
+
+  function openLink(url) {
+    if (!safeLink(url)) return
+    Quickshell.execDetached(["xdg-open", String(url).trim()])
+  }
+
   function rotateNext() {
     if (tiles.length > 1) { rotateIndex = (safeIndex + 1) % tiles.length; rotateTimer.restart() }
   }
@@ -1270,10 +1282,10 @@ Panel {
 
     MouseArea {
       anchors.fill: parent
-      cursorShape: big.game && big.game.link ? Qt.PointingHandCursor : Qt.ArrowCursor
+      cursorShape: big.game && root.safeLink(big.game.link) ? Qt.PointingHandCursor : Qt.ArrowCursor
       onClicked: {
-        if (big.game && big.game.link) {
-          Quickshell.execDetached(["xdg-open", big.game.link])
+        if (big.game && root.safeLink(big.game.link)) {
+          root.openLink(big.game.link)
           root.close()
         }
       }
@@ -1376,10 +1388,10 @@ Panel {
       id: rowMouse
       anchors.fill: parent
       hoverEnabled: true
-      cursorShape: gameRow.game && gameRow.game.link ? Qt.PointingHandCursor : Qt.ArrowCursor
+      cursorShape: gameRow.game && root.safeLink(gameRow.game.link) ? Qt.PointingHandCursor : Qt.ArrowCursor
       onClicked: {
-        if (gameRow.game && gameRow.game.link) {
-          Quickshell.execDetached(["xdg-open", gameRow.game.link])
+        if (gameRow.game && root.safeLink(gameRow.game.link)) {
+          root.openLink(gameRow.game.link)
           root.close()
         }
       }
