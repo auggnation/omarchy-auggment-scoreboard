@@ -57,6 +57,10 @@ Panel {
   readonly property bool cycleLeagues: config.league_in_cycle === true
 
   readonly property color fg: bar ? bar.foreground : Color.foreground
+  // Adaptive bar colour: follows the transparent bar's sampled foreground so
+  // the tile stays legible on any background. `fg` stays the popup colour
+  // (the popup has its own opaque surface).
+  readonly property color barFg: bar ? bar.barForeground : Color.foreground
   readonly property color dim: Qt.darker(fg, 1.5)
   readonly property string fontFamily: bar ? bar.fontFamily : Style.font.family
 
@@ -345,7 +349,7 @@ Panel {
   function gameAccent(g) { return stateColorFor(gameCategory(g)) }
 
   // Bar text colour for non-game tiles: the state colour.
-  readonly property color currentColor: currentTile ? stateColor(currentTile) : fg
+  readonly property color currentColor: currentTile ? stateColor(currentTile) : barFg
 
   // Favourite teams use their colour (custom if set, else ESPN's).
   function teamColor(side, fallback) {
@@ -508,7 +512,7 @@ Panel {
     Rectangle {
       anchors.fill: parent
       radius: Style.cornerRadius
-      color: barHover.hovered ? Style.hoverFillFor(root.fg, Color.accent)
+      color: barHover.hovered ? Style.hoverFillFor(root.barFg, Color.accent)
              : (root.currentTile ? Qt.rgba(root.currentColor.r, root.currentColor.g, root.currentColor.b, 0.18) : "transparent")
       border.width: root.currentTile ? 1 : 0
       border.color: Qt.rgba(root.currentColor.r, root.currentColor.g, root.currentColor.b, 0.6)
@@ -534,7 +538,7 @@ Panel {
         visible: !!root.barGame
         anchors.verticalCenter: parent.verticalCenter
         text: root.barGame ? root.barGame.away.abbr : ""
-        color: root.teamColor(root.barGame ? root.barGame.away : null, root.fg)
+        color: root.teamColor(root.barGame ? root.barGame.away : null, root.barFg)
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         font.bold: true
@@ -552,7 +556,7 @@ Panel {
         visible: !!root.barGame
         anchors.verticalCenter: parent.verticalCenter
         text: root.barGame ? root.barGame.home.abbr : ""
-        color: root.teamColor(root.barGame ? root.barGame.home : null, root.fg)
+        color: root.teamColor(root.barGame ? root.barGame.home : null, root.barFg)
         font.family: root.fontFamily
         font.pixelSize: Style.font.caption
         font.bold: true
